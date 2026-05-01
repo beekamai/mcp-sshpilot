@@ -1,0 +1,60 @@
+{
+  "name": "mcp-sshpilot",
+  "version": "1.1.4",
+  "description": "MCP server for managing remote machines over SSH — proxy support (SOCKS4/5, HTTP/HTTPS CONNECT), SFTP, dangerous-command guard, background jobs, server profiles.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-sshpilot": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist",
+    "servers.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ssh",
+    "sftp",
+    "proxy",
+    "socks",
+    "cursor",
+    "claude",
+    "server-management"
+  ],
+  "author": "beekamai",
+  "homepage": "https://github.com/beekamai/mcp-sshpilot#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beekamai/mcp-sshpilot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/beekamai/mcp-sshpilot/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "socks": "^2.8.8",
+    "ssh2": "^1.15.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "@types/ssh2": "^1.15.0",
+    "tsx": "^4.6.0",
+    "typescript": "^6.0.3"
+  }
+}

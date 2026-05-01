@@ -1,0 +1,44 @@
+{
+  "proxy": {
+    "type": "socks5",
+    "host": "127.0.0.1",
+    "port": 1080,
+    "username": "optional",
+    "password": "optional"
+  },
+  "servers": [
+    {
+      "name": "production",
+      "host": "192.168.1.100",
+      "port": 22,
+      "username": "root",
+      "password": "your-password-here",
+      "description": "Production сервер (использует глобальный proxy)"
+    },
+    {
+      "name": "staging",
+      "host": "staging.example.com",
+      "port": 22,
+      "username": "deploy",
+      "privateKeyPath": "~/.ssh/id_rsa",
+      "passphrase": "key-passphrase-if-needed",
+      "description": "Staging — direct (proxy=null отключает глобальный)",
+      "proxy": null
+    },
+    {
+      "name": "dev-via-http",
+      "host": "10.0.0.50",
+      "port": 2222,
+      "username": "developer",
+      "privateKeyPath": "C:/Users/YourName/.ssh/dev_key",
+      "description": "Dev сервер с собственным HTTP CONNECT прокси",
+      "proxy": {
+        "type": "http",
+        "host": "proxy.corp.local",
+        "port": 8080,
+        "username": "user",
+        "password": "pass"
+      }
+    }
+  ]
+}
