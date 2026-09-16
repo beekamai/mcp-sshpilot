@@ -43,6 +43,13 @@ export interface SSHSession {
   proxyUsed?: ProxyConfig;
 }
 
+/** Parameters of the last successful connect, replayed by ensureConnected() after the session drops. */
+export interface LastConnect {
+  config: ConnectConfig;
+  proxy?: ProxyConfig;
+  label: string;
+}
+
 export interface PendingConfirmation {
   id: string;
   command: string;

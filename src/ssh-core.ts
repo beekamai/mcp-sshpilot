@@ -47,6 +47,7 @@ export async function sshConnect(
         proxyUsed: proxy,
       };
       const proxyStr = proxy ? ` via ${describeProxy(proxy)}` : "";
+      state.lastConnect = { config, proxy, label: `${finalConfig.host}:${finalConfig.port || 22}` };
       addLog("info", `Connected to ${finalConfig.host}:${finalConfig.port || 22}${proxyStr}`);
       resolve(`✅ Connected to ${finalConfig.host}:${finalConfig.port || 22}${proxyStr}`);
     });
@@ -68,7 +69,39 @@ export async function sshConnect(
   });
 }
 
+/** Reconnects with the last connect parameters when the session dropped (keepalive miss, idle cut, network blip). */
+export async function ensureConnected(): Promise<string | null> {
+  if (state.session?.connected) return null;
+  const last = state.lastConnect;
+  if (!last) return null;
+  if (state.session) {
+    try { state.session.client.end(); } catch { /* already gone */ }
+    state.session = null;
+  }
+  await sshConnect(last.config, last.proxy);
+  return `♻️ Session to ${last.label} had dropped; reconnected automatically.`;
+}
+
+/** Rejects when a session-bound operation exceeds its deadline and marks the session dead so the next call reconnects. */
+export function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      addLog("error", `${label} timed out after ${ms} ms; session marked dead`);
+      if (state.session) {
+        state.session.connected = false;
+        try { state.session.client.end(); } catch { /* already gone */ }
+      }
+      reject(new Error(`${label} timed out after ${Math.round(ms / 1000)} s; the session was reset, retry the call`));
+    }, ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
 export function sshDisconnect(cleanupTemp = false): string {
+  state.lastConnect = null;
   if (!state.session) return "No active connection";
   state.session.client.end();
   const host = state.session.config.host;

@@ -5,13 +5,20 @@ import type {
   BackgroundJob,
   ProxyOverride,
   LogEntry,
+  LastConnect,
 } from "./types.js";
 
 export const DEFAULT_EXEC_TIMEOUT_MS = 5 * 60 * 1000;
 export const DEFAULT_KEEPALIVE_MS = 10_000;
 export const DEFAULT_READY_TIMEOUT_MS = 30_000;
 
-export const state: { session: SSHSession | null } = { session: null };
+export const DEFAULT_SFTP_TIMEOUT_MS = 60_000;
+export const DEFAULT_TRANSFER_TIMEOUT_MS = 10 * 60 * 1000;
+
+export const state: { session: SSHSession | null; lastConnect: LastConnect | null } = {
+  session: null,
+  lastConnect: null,
+};
 
 export const pendingConfirmations: Map<string, PendingConfirmation> = new Map();
 export const pendingDeleteConfirmations: Map<string, PendingDeleteConfirmation> = new Map();

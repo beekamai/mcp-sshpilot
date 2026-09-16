@@ -2,6 +2,9 @@ import type { ConnectConfig } from "ssh2";
 import type { ServerProfile, ProxyConfig } from "./types.js";
 import {
   state,
+  DEFAULT_EXEC_TIMEOUT_MS,
+  DEFAULT_SFTP_TIMEOUT_MS,
+  DEFAULT_TRANSFER_TIMEOUT_MS,
   addLog,
   pendingConfirmations,
   pendingDeleteConfirmations,
@@ -21,6 +24,8 @@ import {
 import { describeProxy, validateProxy, resolveProxyForProfile } from "./proxy.js";
 import {
   sshConnect,
+  ensureConnected,
+  withDeadline,
   sshDisconnect,
   sshExecute,
   sshExecuteBackground,
@@ -51,7 +56,56 @@ import {
   cleanupAllTempFiles,
 } from "./temp.js";
 
+const SESSION_FREE_TOOLS = new Set([
+  "ssh_connect",
+  "ssh_connect_profile",
+  "ssh_disconnect",
+  "ssh_status",
+  "ssh_list_profiles",
+  "ssh_server_add",
+  "ssh_server_remove",
+  "ssh_server_update",
+  "ssh_proxy_status",
+  "ssh_proxy_set",
+  "ssh_proxy_enable",
+  "ssh_proxy_disable",
+  "ssh_pending_confirmations",
+  "ssh_read_background",
+  "ssh_list_background",
+  "ssh_temp_list",
+  "ssh_temp_read",
+  "ssh_temp_write",
+  "ssh_temp_delete",
+  "ssh_temp_cleanup",
+  "ssh_temp_path",
+  "ssh_get_logs",
+]);
+
+const TRANSFER_TOOLS = new Set(["ssh_upload", "ssh_download_file", "ssh_temp_upload", "ssh_copy"]);
+
 export async function handleToolCall(name: string, args: any): Promise<{
+  content: { type: "text"; text: string }[];
+  isError?: boolean;
+}> {
+  try {
+    let reconnectNote: string | null = null;
+    if (!SESSION_FREE_TOOLS.has(name)) {
+      reconnectNote = await ensureConnected();
+    }
+    const execLimit = (typeof args?.timeout_ms === "number" && args.timeout_ms > 0 ? args.timeout_ms : DEFAULT_EXEC_TIMEOUT_MS) + 5_000;
+    const deadline = name === "ssh_execute" || name === "ssh_execute_dangerous" ? execLimit : TRANSFER_TOOLS.has(name) ? DEFAULT_TRANSFER_TIMEOUT_MS : DEFAULT_SFTP_TIMEOUT_MS;
+    const result = await withDeadline(dispatch(name, args), deadline, name);
+    if (reconnectNote && result.content.length > 0 && result.content[0].type === "text") {
+      result.content[0].text = `${reconnectNote}\n${result.content[0].text}`;
+    }
+    return result;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return { content: [{ type: "text", text: `❌ Error: ${msg}` }], isError: true };
+  }
+}
+
+async function dispatch(name: string, args: any): Promise<{
   content: { type: "text"; text: string }[];
   isError?: boolean;
 }> {
