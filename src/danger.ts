@@ -31,6 +31,7 @@ export const DANGEROUS_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /\bkill\s+-9\b/, reason: "Forced process kill" },
   { pattern: /\bkillall\b/, reason: "Killing processes by name" },
   { pattern: /\bpkill\b/, reason: "Killing processes" },
+  { pattern: /\bdeploy-battle(\.sh)?\b/, reason: "Game unit deploy script (stops and restarts a service inside)" },
 ];
 
 export function checkDangerousCommand(command: string): { isDangerous: boolean; reasons: string[] } {
