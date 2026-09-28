@@ -1,4 +1,5 @@
-import type { Client, ConnectConfig } from "ssh2";
+import type { Client, ConnectConfig, SFTPWrapper } from "ssh2";
+import type { OutputTail } from "./utils.js";
 
 export type ProxyType = "socks4" | "socks5" | "http" | "https";
 
@@ -41,6 +42,12 @@ export interface SSHSession {
   logs: LogEntry[];
   startTime: Date;
   proxyUsed?: ProxyConfig;
+  /** Random per connection; confirmations are bound to it so they cannot fire on another server. */
+  id: string;
+  /** user@host:port [via proxy], shown when a confirmation is refused. */
+  target: string;
+  /* One SFTP channel per session: opening one per call exhausts sshd MaxSessions (default 10). */
+  sftp?: Promise<SFTPWrapper>;
 }
 
 /** Parameters of the last successful connect, replayed by ensureConnected() after the session drops. */
@@ -55,6 +62,10 @@ export interface PendingConfirmation {
   command: string;
   reason: string;
   createdAt: Date;
+  sessionId: string;
+  target: string;
+  timeoutMs?: number;
+  background?: boolean;
 }
 
 export interface PendingDeleteConfirmation {
@@ -62,6 +73,8 @@ export interface PendingDeleteConfirmation {
   path: string;
   isDirectory: boolean;
   createdAt: Date;
+  sessionId: string;
+  target: string;
 }
 
 export interface TempFile {
@@ -79,8 +92,8 @@ export interface BackgroundJob {
   id: string;
   command: string;
   startedAt: Date;
-  stdout: string;
-  stderr: string;
+  stdout: OutputTail;
+  stderr: OutputTail;
   done: boolean;
   exitCode: number | null;
   stream: any;

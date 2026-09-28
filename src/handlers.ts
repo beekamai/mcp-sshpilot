@@ -2,6 +2,7 @@ import type { ConnectConfig } from "ssh2";
 import type { ServerProfile, ProxyConfig } from "./types.js";
 import {
   state,
+  CONFIRMATION_TTL_MS,
   DEFAULT_EXEC_TIMEOUT_MS,
   DEFAULT_SFTP_TIMEOUT_MS,
   DEFAULT_TRANSFER_TIMEOUT_MS,
@@ -26,6 +27,7 @@ import {
   sshConnect,
   ensureConnected,
   withDeadline,
+  clampTimeout,
   sshDisconnect,
   sshExecute,
   sshExecuteBackground,
@@ -83,6 +85,35 @@ const SESSION_FREE_TOOLS = new Set([
 
 const TRANSFER_TOOLS = new Set(["ssh_upload", "ssh_download_file", "ssh_temp_upload", "ssh_copy"]);
 
+/* A confirmation is only valid in the connection it was issued in (a reconnect or another server voids it) and only for a limited time. */
+function confirmationProblem(p: { sessionId: string; target: string; createdAt: Date }): string | null {
+  if (Date.now() - p.createdAt.getTime() > CONFIRMATION_TTL_MS) return "expired";
+  if (state.session?.id !== p.sessionId) {
+    return `issued for ${p.target} in an earlier connection; current: ${state.session?.target ?? "not connected"}`;
+  }
+  return null;
+}
+
+function pruneExpiredConfirmations(): void {
+  const now = Date.now();
+  for (const map of [pendingConfirmations, pendingDeleteConfirmations] as Map<string, { createdAt: Date }>[]) {
+    for (const [id, p] of map) if (now - p.createdAt.getTime() > CONFIRMATION_TTL_MS) map.delete(id);
+  }
+}
+
+async function startBackground(command: string): Promise<{ content: { type: "text"; text: string }[] }> {
+  const { id } = await sshExecuteBackground(command);
+  return {
+    content: [{
+      type: "text",
+      text:
+        `🟢 Background job started\njob_id: ${id}\ncommand: ${command}\n\n` +
+        `Read:  ssh_read_background({job_id:"${id}"})\n` +
+        `Stop:  ssh_kill_background({job_id:"${id}"})`,
+    }],
+  };
+}
+
 export async function handleToolCall(name: string, args: any): Promise<{
   content: { type: "text"; text: string }[];
   isError?: boolean;
@@ -92,7 +123,8 @@ export async function handleToolCall(name: string, args: any): Promise<{
     if (!SESSION_FREE_TOOLS.has(name)) {
       reconnectNote = await ensureConnected();
     }
-    const execLimit = (typeof args?.timeout_ms === "number" && args.timeout_ms > 0 ? args.timeout_ms : DEFAULT_EXEC_TIMEOUT_MS) + 5_000;
+    const requested = name === "ssh_execute_dangerous" ? pendingConfirmations.get(args?.confirmation_id)?.timeoutMs : args?.timeout_ms;
+    const execLimit = (clampTimeout(requested) ?? DEFAULT_EXEC_TIMEOUT_MS) + 5_000;
     const deadline = name === "ssh_execute" || name === "ssh_execute_dangerous" ? execLimit : TRANSFER_TOOLS.has(name) ? DEFAULT_TRANSFER_TIMEOUT_MS : DEFAULT_SFTP_TIMEOUT_MS;
     const result = await withDeadline(dispatch(name, args), deadline, name);
     if (reconnectNote && result.content.length > 0 && result.content[0].type === "text") {
@@ -296,17 +328,24 @@ async function dispatch(name: string, args: any): Promise<{
         return { content: [{ type: "text", text: "✅ Runtime override cleared. servers.json settings are used." }] };
       }
 
-      case "ssh_execute": {
+      case "ssh_execute":
+      case "ssh_execute_background": {
         const command = args?.command as string;
-        const timeoutMs = args?.timeout_ms as number | undefined;
+        const background = name === "ssh_execute_background";
+        const timeoutMs = background ? undefined : clampTimeout(args?.timeout_ms);
         const dangerCheck = checkDangerousCommand(command);
         if (dangerCheck.isDangerous) {
+          if (!state.session?.connected) throw new Error("No active SSH connection");
           const confirmId = generateId();
           pendingConfirmations.set(confirmId, {
             id: confirmId,
             command,
             reason: dangerCheck.reasons.join(", "),
             createdAt: new Date(),
+            sessionId: state.session.id,
+            target: state.session.target,
+            timeoutMs,
+            background,
           });
           addLog("warning", `Dangerous command requires confirmation: ${command}`);
           return {
@@ -314,16 +353,19 @@ async function dispatch(name: string, args: any): Promise<{
               type: "text",
               text:
                 `⚠️ DANGEROUS COMMAND REQUIRES CONFIRMATION\n\n` +
-                `Command: ${command}\nReasons: ${dangerCheck.reasons.join(", ")}\n\n` +
+                `Command: ${command}\nServer: ${state.session.target}${background ? " (background job)" : ""}\n` +
+                `Reasons: ${dangerCheck.reasons.join(", ")}\n\n` +
                 `ssh_execute_dangerous { confirmation_id: "${confirmId}", confirm: true }`,
             }],
           };
         }
+        if (background) return await startBackground(command);
         const result = await sshExecute(command, timeoutMs);
         return { content: [{ type: "text", text: result }] };
       }
 
       case "ssh_execute_dangerous": {
+        pruneExpiredConfirmations();
         const confirmId = args?.confirmation_id as string;
         const confirm = args?.confirm as boolean;
         const pending = pendingConfirmations.get(confirmId);
@@ -333,23 +375,14 @@ async function dispatch(name: string, args: any): Promise<{
           addLog("info", `Command cancelled: ${pending.command}`);
           return { content: [{ type: "text", text: `✅ Cancelled: ${pending.command}` }] };
         }
+        const problem = confirmationProblem(pending);
+        if (problem) {
+          return { content: [{ type: "text", text: `❌ Confirmation "${confirmId}" refused (${problem}). Re-run ${pending.background ? "ssh_execute_background" : "ssh_execute"} to get a new one.` }], isError: true };
+        }
         addLog("warning", `Dangerous command confirmed: ${pending.command}`);
-        const result = await sshExecute(pending.command);
+        if (pending.background) return await startBackground(pending.command);
+        const result = await sshExecute(pending.command, pending.timeoutMs);
         return { content: [{ type: "text", text: result }] };
-      }
-
-      case "ssh_execute_background": {
-        const command = args?.command as string;
-        const { id } = await sshExecuteBackground(command);
-        return {
-          content: [{
-            type: "text",
-            text:
-              `🟢 Background job started\njob_id: ${id}\ncommand: ${command}\n\n` +
-              `Read:  ssh_read_background({job_id:"${id}"})\n` +
-              `Stop:  ssh_kill_background({job_id:"${id}"})`,
-          }],
-        };
       }
 
       case "ssh_read_background":
@@ -475,12 +508,15 @@ async function dispatch(name: string, args: any): Promise<{
       case "ssh_delete": {
         const remotePath = args?.remote_path as string;
         const isDirectory = (args?.is_directory as boolean) || false;
+        if (!state.session?.connected) throw new Error("No active SSH connection");
         const confirmId = generateId();
         pendingDeleteConfirmations.set(confirmId, {
           id: confirmId,
           path: remotePath,
           isDirectory,
           createdAt: new Date(),
+          sessionId: state.session.id,
+          target: state.session.target,
         });
         addLog("warning", `Deletion requires confirmation: ${remotePath}`);
         return {
@@ -494,6 +530,7 @@ async function dispatch(name: string, args: any): Promise<{
       }
 
       case "ssh_delete_confirm": {
+        pruneExpiredConfirmations();
         const confirmId = args?.confirmation_id as string;
         const confirm = args?.confirm as boolean;
         const pending = pendingDeleteConfirmations.get(confirmId);
@@ -502,6 +539,10 @@ async function dispatch(name: string, args: any): Promise<{
         if (!confirm) {
           addLog("info", `Deletion cancelled: ${pending.path}`);
           return { content: [{ type: "text", text: `✅ Cancelled: ${pending.path}` }] };
+        }
+        const problem = confirmationProblem(pending);
+        if (problem) {
+          return { content: [{ type: "text", text: `❌ Confirmation "${confirmId}" refused (${problem}). Re-run ssh_delete to get a new one.` }], isError: true };
         }
         addLog("warning", `Deletion confirmed: ${pending.path}`);
         return { content: [{ type: "text", text: await sshDelete(pending.path, pending.isDirectory) }] };
@@ -536,9 +577,10 @@ async function dispatch(name: string, args: any): Promise<{
         return { content: [{ type: "text", text: sshDisconnect((args?.cleanup_temp as boolean) || false) }] };
 
       case "ssh_pending_confirmations": {
+        pruneExpiredConfirmations();
         if (pendingConfirmations.size === 0) return { content: [{ type: "text", text: "No pending confirmations" }] };
         const list = Array.from(pendingConfirmations.values())
-          .map((p) => `ID: ${p.id}\nCommand: ${p.command}\nReason: ${p.reason}`)
+          .map((p) => `ID: ${p.id}\nServer: ${p.target}\nCommand: ${p.command}\nReason: ${p.reason}`)
           .join("\n\n");
         return { content: [{ type: "text", text: list }] };
       }

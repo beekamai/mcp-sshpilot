@@ -3,8 +3,9 @@ dist/
 *.log
 .env
 .DS_Store
-servers.json
+servers.json*
 *.zip
 *.tar.gz
 .vscode/
 .idea/
+*.tgz

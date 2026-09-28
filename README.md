@@ -228,7 +228,7 @@ The AI **never sees proxy passwords** in `ssh_proxy_status` — only `type://use
 
 | Tool | Description |
 |---|---|
-| `ssh_execute` | Run a command. Hard timeout `timeout_ms` (default 300000). For long-running / daemon-like commands use `ssh_execute_background` instead, or detach descriptors: `cmd > /dev/null 2>&1 < /dev/null & disown` |
+| `ssh_execute` | Run a command. A non-zero exit is reported as `[exit code: N]` at the end of the output. Hard timeout `timeout_ms` (default 300000). For long-running / daemon-like commands use `ssh_execute_background` instead, or detach descriptors: `cmd > /dev/null 2>&1 < /dev/null & disown` |
 | `ssh_execute_dangerous` | Confirm/cancel via `confirmation_id` |
 | `ssh_execute_background` | Run in background, returns `job_id` |
 | `ssh_read_background` | Read stdout/stderr/status |
@@ -260,7 +260,7 @@ The MCP resource `ssh://logs` is also exposed.
 ### Security & secret hygiene
 
 - `servers.json` is in `.gitignore` — **don't commit credentials**.
-- Dangerous commands (full list below) are auto-blocked and require `ssh_execute_dangerous` with `confirm: true`. `ssh_delete` also requires confirmation.
+- Dangerous commands (full list below) are auto-blocked and require `ssh_execute_dangerous` with `confirm: true`. `ssh_delete` also requires confirmation. The same check applies to `ssh_execute_background`. A confirmation is bound to the connection it was issued in and expires after 10 minutes — it is refused after switching servers or reconnecting.
 - The AI sees only the profile name, host:port, description, and `type://user@host:port` proxy — never passwords or private keys.
 
 #### Block agents from reading `servers.json`
@@ -290,7 +290,7 @@ Belt-and-suspenders: keep `servers.json` outside the workspace entirely (option 
 
 #### Dangerous patterns
 
-Removal (`rm -rf`, `rmdir`), formatting (`mkfs`, `dd if=`, `fdisk`, `parted`), system (`shutdown`, `reboot`, `init 0/6`), services (`systemctl stop/disable/mask`, `service stop`), permissions (`chmod *7*`, `chown -R`, `userdel`, `groupdel`), network (`iptables -F`, `ufw disable`), packages (`apt remove/purge/autoremove`, `yum/dnf remove/erase`), DB (`DROP DATABASE/TABLE/USER`, `TRUNCATE`, `DELETE FROM`), Docker (`docker rm/rmi`, `system prune`, `docker-compose down`), processes (`kill -9`, `killall`, `pkill`), pipes into shell.
+Removal (`rm -rf`, `rmdir`), formatting (`mkfs`, `dd if=`, `fdisk`, `parted`), system (`shutdown`, `reboot`, `init 0/6`), services (`systemctl stop/disable/mask`, `service stop`), permissions (world-writable `chmod`: `777`, `666`, `o+w`; `chown -R`, `userdel`, `groupdel`), network (`iptables -F`, `ufw disable`), packages (`apt remove/purge/autoremove`, `yum/dnf remove/erase`), DB (`DROP DATABASE/TABLE/USER`, `TRUNCATE`, `DELETE FROM`), Docker (`docker rm/rmi`, `system prune`, `docker compose` / `docker-compose` `down/rm`, `docker volume/network/image/container rm/prune`), processes (`kill -9`, `killall`, `pkill`), pipes into shell.
 
 <details>
 <summary>Project layout</summary>
@@ -538,7 +538,7 @@ AI **не видит пароли проксей** при `ssh_proxy_status` —
 
 | Tool | Описание |
 |---|---|
-| `ssh_execute` | Выполнить команду. Жёсткий таймаут `timeout_ms` (default 300000). Для долгих/демонских команд используй `ssh_execute_background`, или отвязывай дескрипторы: `cmd > /dev/null 2>&1 < /dev/null & disown` |
+| `ssh_execute` | Выполнить команду. Ненулевой выход дописывается в конец вывода как `[exit code: N]`. Жёсткий таймаут `timeout_ms` (default 300000). Для долгих/демонских команд используй `ssh_execute_background`, или отвязывай дескрипторы: `cmd > /dev/null 2>&1 < /dev/null & disown` |
 | `ssh_execute_dangerous` | Подтвердить/отменить опасную по `confirmation_id` |
 | `ssh_execute_background` | Запустить в фоне, возвращает `job_id` |
 | `ssh_read_background` | Прочитать stdout/stderr/статус |
@@ -570,7 +570,7 @@ AI **не видит пароли проксей** при `ssh_proxy_status` —
 ### Безопасность и работа с секретами
 
 - `servers.json` в `.gitignore` — **не коммить пароли**.
-- Опасные команды (см. список ниже) автоматически блокируются и требуют `ssh_execute_dangerous` с `confirm: true`. `ssh_delete` тоже требует подтверждения.
+- Опасные команды (см. список ниже) автоматически блокируются и требуют `ssh_execute_dangerous` с `confirm: true`. `ssh_delete` тоже требует подтверждения. Та же проверка действует для `ssh_execute_background`. Подтверждение привязано к подключению, в котором выдано, и живёт 10 минут — после переключения сервера или переподключения оно отклоняется.
 - AI видит только имя профиля, host:port, описание и `type://user@host:port` — никаких паролей и ключей.
 
 #### Запретить агенту читать `servers.json`
@@ -600,7 +600,7 @@ Belt-and-suspenders: храни `servers.json` вне workspace (вариант 
 
 #### Опасные паттерны
 
-Удаление (`rm -rf`, `rmdir`), форматирование (`mkfs`, `dd if=`, `fdisk`, `parted`), система (`shutdown`, `reboot`, `init 0/6`), сервисы (`systemctl stop/disable/mask`, `service stop`), права (`chmod *7*`, `chown -R`, `userdel`, `groupdel`), сеть (`iptables -F`, `ufw disable`), пакеты (`apt remove/purge/autoremove`, `yum/dnf remove/erase`), БД (`DROP DATABASE/TABLE/USER`, `TRUNCATE`, `DELETE FROM`), Docker (`docker rm/rmi`, `system prune`, `docker-compose down`), процессы (`kill -9`, `killall`, `pkill`), пайпы в shell.
+Удаление (`rm -rf`, `rmdir`), форматирование (`mkfs`, `dd if=`, `fdisk`, `parted`), система (`shutdown`, `reboot`, `init 0/6`), сервисы (`systemctl stop/disable/mask`, `service stop`), права (`chmod`, открывающий запись всем: `777`, `666`, `o+w`; `chown -R`, `userdel`, `groupdel`), сеть (`iptables -F`, `ufw disable`), пакеты (`apt remove/purge/autoremove`, `yum/dnf remove/erase`), БД (`DROP DATABASE/TABLE/USER`, `TRUNCATE`, `DELETE FROM`), Docker (`docker rm/rmi`, `system prune`, `docker compose` / `docker-compose` `down/rm`, `docker volume/network/image/container rm/prune`), процессы (`kill -9`, `killall`, `pkill`), пайпы в shell.
 
 <details>
 <summary>Структура проекта</summary>

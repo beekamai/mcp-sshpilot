@@ -1,3 +1,4 @@
+import { detach } from "./utils.js";
 import type {
   SSHSession,
   PendingConfirmation,
@@ -14,6 +15,10 @@ export const DEFAULT_READY_TIMEOUT_MS = 30_000;
 
 export const DEFAULT_SFTP_TIMEOUT_MS = 60_000;
 export const DEFAULT_TRANSFER_TIMEOUT_MS = 10 * 60 * 1000;
+export const CONFIRMATION_TTL_MS = 10 * 60 * 1000;
+
+const MAX_LOG_ENTRIES = 500;
+const MAX_LOG_ENTRY_CHARS = 4096;
 
 export const state: { session: SSHSession | null; lastConnect: LastConnect | null } = {
   session: null,
@@ -33,7 +38,9 @@ export function getProxyOverride(): ProxyOverride {
 }
 
 export function addLog(type: LogEntry["type"], content: string): void {
-  if (state.session) {
-    state.session.logs.push({ timestamp: new Date(), type, content });
-  }
+  if (!state.session) return;
+  const logs = state.session.logs;
+  const text = content.length > MAX_LOG_ENTRY_CHARS ? detach(content.slice(0, MAX_LOG_ENTRY_CHARS)) + "...[trimmed]" : content;
+  logs.push({ timestamp: new Date(), type, content: text });
+  if (logs.length > MAX_LOG_ENTRIES) logs.splice(0, logs.length - MAX_LOG_ENTRIES);
 }

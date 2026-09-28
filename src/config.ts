@@ -1,11 +1,13 @@
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from "fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, renameSync, unlinkSync, realpathSync } from "fs";
+import { randomBytes } from "crypto";
 import { fileURLToPath } from "url";
-import { dirname, join } from "path";
+import { dirname, join, isAbsolute } from "path";
 import { homedir } from "os";
 import type { ConnectConfig } from "ssh2";
 import type { ServersConfig, ServerProfile, ProxyConfig } from "./types.js";
 import { describeProxy, resolveProxyForProfile } from "./proxy.js";
 import { DEFAULT_KEEPALIVE_MS, DEFAULT_READY_TIMEOUT_MS } from "./state.js";
+import { assertNotUnc } from "./utils.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -34,15 +36,20 @@ function expandHome(p: string): string {
 
 export const SERVERS_CONFIG_PATH = resolveConfigPath();
 
+/* A broken file must throw: returning an empty list here would let ssh_server_add overwrite every saved profile. */
 export function loadServersConfig(): ServersConfig {
+  if (!existsSync(SERVERS_CONFIG_PATH)) return { servers: [] };
+  const raw = readFileSync(SERVERS_CONFIG_PATH, "utf-8");
+  let parsed: ServersConfig;
   try {
-    if (!existsSync(SERVERS_CONFIG_PATH)) return { servers: [] };
-    const parsed = JSON.parse(readFileSync(SERVERS_CONFIG_PATH, "utf-8")) as ServersConfig;
-    if (!Array.isArray(parsed.servers)) parsed.servers = [];
-    return parsed;
-  } catch {
-    return { servers: [] };
+    parsed = JSON.parse(raw) as ServersConfig;
+  } catch (e) {
+    /* Only the position: Node's JSON.parse message quotes the surrounding text, which may be a password. */
+    const where = /position \d+(?: \(line \d+ column \d+\))?/.exec(e instanceof Error ? e.message : "")?.[0];
+    throw new Error(`Servers config ${SERVERS_CONFIG_PATH} is not valid JSON${where ? ` (at ${where})` : ""}. Fix it by hand; it was left untouched.`);
   }
+  if (!Array.isArray(parsed.servers)) parsed.servers = [];
+  return parsed;
 }
 
 /* Ensure the config file exists at startup. Creates parent dirs and writes
@@ -52,14 +59,34 @@ export function ensureServersConfigExists(): { created: boolean; path: string } 
   if (existsSync(SERVERS_CONFIG_PATH)) return { created: false, path: SERVERS_CONFIG_PATH };
   const dir = dirname(SERVERS_CONFIG_PATH);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(SERVERS_CONFIG_PATH, JSON.stringify({ servers: [] }, null, 2) + "\n", "utf-8");
+  writeFileSync(SERVERS_CONFIG_PATH, JSON.stringify({ servers: [] }, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
   return { created: true, path: SERVERS_CONFIG_PATH };
 }
 
+/* Temp file + rename so a crash mid-write cannot truncate the profiles. The temp name is random and
+ * created exclusively (no pre-planted file), 0600 on POSIX because the file holds passwords. */
 export function saveServersConfig(cfg: ServersConfig): void {
   const dir = dirname(SERVERS_CONFIG_PATH);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(SERVERS_CONFIG_PATH, JSON.stringify(cfg, null, 2) + "\n", "utf-8");
+  /* Write through a symlinked config (dotfiles) instead of replacing the link with a plain file. */
+  const target = existsSync(SERVERS_CONFIG_PATH) ? realpathSync(SERVERS_CONFIG_PATH) : SERVERS_CONFIG_PATH;
+  const tmp = `${target}.${randomBytes(8).toString("hex")}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n", { encoding: "utf-8", mode: 0o600, flag: "wx" });
+    renameSync(tmp, target);
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* never created or already renamed */ }
+    throw e;
+  }
+}
+
+/* Relative key paths resolve against the config dir first, then the package dir (legacy layout). */
+function resolveKeyPath(p: string): string {
+  const expanded = expandHome(p);
+  assertNotUnc(expanded, "key");
+  if (isAbsolute(expanded)) return expanded;
+  const nearConfig = join(dirname(SERVERS_CONFIG_PATH), expanded);
+  return existsSync(nearConfig) ? nearConfig : join(__dirname, "..", expanded);
 }
 
 export function getServerProfile(profileName: string): ServerProfile | null {
@@ -87,14 +114,12 @@ export function listProfiles(): {
 export function profileToConnectConfig(profile: ServerProfile): ConnectConfig {
   let privateKey: string | undefined;
   if (profile.privateKeyPath) {
+    const keyPath = resolveKeyPath(profile.privateKeyPath);
     try {
-      const keyPath =
-        profile.privateKeyPath.startsWith("/") || profile.privateKeyPath.includes(":")
-          ? profile.privateKeyPath
-          : join(__dirname, "..", profile.privateKeyPath);
       privateKey = readFileSync(keyPath, "utf-8");
-    } catch {
-      throw new Error(`Failed to read SSH key: ${profile.privateKeyPath}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(`Failed to read SSH key ${profile.privateKeyPath} (${keyPath}): ${msg}`);
     }
   }
   return {
