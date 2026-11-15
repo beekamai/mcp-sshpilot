@@ -48,7 +48,7 @@ const USAGE = `Usage: mcp-sshpilot [command]
   vault pin-host-key <profile> <SHA256:...> | --clear
                                        pin a profile's SSH host key (verified out of band), or drop the pin
   serve [--host 127.0.0.1] [--port 8722] [--tls-cert <file> --tls-key <file>]
-        [--allowed-origin <origin>]... [--trust-proxy] [--insecure-http] [--allow-local-targets]
+        [--allowed-origin <origin>]... [--trust-proxy] [--insecure-http] [--allow-local-targets] [--allow-tofu]
         [--oauth --public-url <https://host> [--oauth-redirect <uri>]...]
                                        run the remote MCP server (Streamable HTTP); --oauth also lets
                                        Claude connectors in, each limited to the profiles you approve
@@ -396,7 +396,7 @@ function parseServe(args: string[]): Omit<HttpServerOptions, "buildServer"> {
   const p = parseArgs(
     args,
     ["host", "port", "tls-cert", "tls-key", "allowed-origin", "public-url", "oauth-redirect"],
-    ["insecure-http", "trust-proxy", "allow-local-targets", "oauth"],
+    ["insecure-http", "trust-proxy", "allow-local-targets", "allow-tofu", "oauth"],
   );
   expectPositional(p, 0, "no positional arguments for serve");
   const portText = single(p, "port") ?? "8722";
@@ -436,6 +436,7 @@ function parseServe(args: string[]): Omit<HttpServerOptions, "buildServer"> {
     insecureHttp: p.flags.has("insecure-http"),
     trustProxy: p.flags.has("trust-proxy"),
     allowLocalTargets: p.flags.has("allow-local-targets"),
+    allowTofu: p.flags.has("allow-tofu"),
     ...(oauth ? { oauth } : {}),
     vaultPath: resolveVaultPath(),
   };

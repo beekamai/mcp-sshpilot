@@ -199,15 +199,24 @@ The AI **never sees proxy passwords** in `ssh_proxy_status` — only `type://use
 
 ### Tools (for the AI)
 
+**Several connections at once.** One session holds up to 16 connections (remote mode: 4 per session), named
+after their profile (case-insensitive) or `user@host:port` for `ssh_connect`, so parallel subagents of one client
+neither block nor retarget each other. Every tool that acts on a server takes an optional `profile`: given, that
+connection is used, and a saved profile that is not connected yet is connected first (same pin checks as
+`ssh_connect_profile`); omitted, the only open connection is used. With several open and no `profile`, the call is
+refused and nothing runs. Confirmations, background jobs and temp files stay bound to the connection they came from:
+`ssh_execute_dangerous` / `ssh_delete_confirm` always run there, `ssh_temp_upload` without `profile` goes back there.
+
 #### Connection / profiles
 
 | Tool | Description |
 |---|---|
-| `ssh_connect` | Direct connect with explicit params (+ optional `proxy`) |
-| `ssh_connect_profile` | Connect by profile name. AI does not see credentials |
+| `ssh_connect` | Direct connect with explicit params (+ optional `proxy`); the connection is named `user@host:port` |
+| `ssh_connect_profile` | Connect by profile name. AI does not see credentials. Optional: a tool called with `profile` connects it on first use |
 | `ssh_list_profiles` | Profile list with description and active proxy |
-| `ssh_status` | Session status (incl. proxy used) |
-| `ssh_disconnect` | Disconnect (`cleanup_temp` clears temp store) |
+| `ssh_status` | Status of every open connection, incl. proxy used and host key (`profile` shows one) |
+| `ssh_disconnect` | `profile` closes one, `all: true` closes all; without either only when exactly one is open. `cleanup_temp` removes its temp files |
+| `ssh_pin_host_keys` | Pin host keys without credentials: key exchange only, aborted before authentication. Default: every unpinned profile; never overwrites a pin (stdio only) |
 
 #### Server CRUD
 
@@ -235,7 +244,7 @@ The AI **never sees proxy passwords** in `ssh_proxy_status` — only `type://use
 | `ssh_execute_background` | Run in background, returns `job_id` |
 | `ssh_read_background` | Read stdout/stderr/status |
 | `ssh_kill_background` | Kill a background job (SIGKILL, close channel) |
-| `ssh_list_background` | List all jobs |
+| `ssh_list_background` | List all jobs with their connection (`profile` filters) |
 | `ssh_pending_confirmations` | List awaiting confirmations |
 
 #### Files / SFTP
@@ -247,7 +256,7 @@ The AI **never sees proxy passwords** in `ssh_proxy_status` — only `type://use
 | `ssh_file_info` | stat (size, mode, owner, mtime) |
 | `ssh_mkdir` (recursive) / `ssh_rename` / `ssh_chmod` / `ssh_copy` | Standard ops |
 | `ssh_delete` + `ssh_delete_confirm` | Delete with confirmation |
-| `ssh_download_file` | Download to temp store, return preview + ID |
+| `ssh_download_file` | Download to temp store, return preview + ID; `as_base64: true` returns the whole file inline as base64 up to 2 MiB |
 | `ssh_temp_list` / `read` / `write` / `upload` / `delete` / `cleanup` / `path` | Temp store (edit before re-upload) |
 | `ssh_upload` | File → SFTP. Directory → tar.gz + upload + extract (`exclude` patterns supported) |
 
@@ -255,7 +264,7 @@ The AI **never sees proxy passwords** in `ssh_proxy_status` — only `type://use
 
 | Tool | Description |
 |---|---|
-| `ssh_get_logs` | Current session log. `limit` — last N |
+| `ssh_get_logs` | Log of all connections, entries tagged `[name]`. `limit` — last N, `profile` — one connection |
 
 The MCP resource `ssh://logs` is also exposed.
 
@@ -548,15 +557,25 @@ AI **не видит пароли проксей** при `ssh_proxy_status` —
 
 ### Доступные инструменты
 
+**Несколько подключений сразу.** Одна сессия держит до 16 подключений (в remote mode — 4 на сессию), названных
+по профилю (без учёта регистра) или `user@host:port` для `ssh_connect`, так что параллельные субагенты одного клиента
+не блокируют и не перенаправляют друг друга. Каждый инструмент, работающий с сервером, принимает необязательный
+`profile`: если он задан — используется это подключение, а сохранённый, но ещё не подключённый профиль сначала
+подключается (с теми же проверками пина, что у `ssh_connect_profile`); если не задан — используется единственное
+открытое подключение. Когда открыто несколько, а `profile` не передан, вызов отклоняется и ничего не выполняется.
+Подтверждения, фоновые задачи и temp-файлы привязаны к подключению, где появились: `ssh_execute_dangerous` /
+`ssh_delete_confirm` всегда выполняются там же, `ssh_temp_upload` без `profile` заливает туда же.
+
 #### Подключение / профили
 
 | Tool | Описание |
 |---|---|
-| `ssh_connect` | Прямой коннект с явными параметрами (+ опциональный `proxy`) |
-| `ssh_connect_profile` | Коннект по имени профиля. AI не видит креды |
+| `ssh_connect` | Прямой коннект с явными параметрами (+ опциональный `proxy`); подключение называется `user@host:port` |
+| `ssh_connect_profile` | Коннект по имени профиля. AI не видит креды. Необязателен: инструмент с `profile` подключит профиль сам |
 | `ssh_list_profiles` | Список профилей с описанием и активным proxy |
-| `ssh_status` | Статус сессии (включая использованный proxy) |
-| `ssh_disconnect` | Отключиться (`cleanup_temp` чистит temp store) |
+| `ssh_status` | Статус всех открытых подключений, включая proxy и ключ хоста (`profile` — одно) |
+| `ssh_disconnect` | `profile` закрывает одно, `all: true` — все; без них — только если открыто ровно одно. `cleanup_temp` удаляет его temp-файлы |
+| `ssh_pin_host_keys` | Запинить ключи хостов без кредов: только обмен ключами, обрыв до аутентификации. По умолчанию — все профили без пина; существующий пин не перезаписывает (только stdio) |
 
 #### CRUD серверов
 
@@ -584,7 +603,7 @@ AI **не видит пароли проксей** при `ssh_proxy_status` —
 | `ssh_execute_background` | Запустить в фоне, возвращает `job_id` |
 | `ssh_read_background` | Прочитать stdout/stderr/статус |
 | `ssh_kill_background` | Убить фоновую задачу (SIGKILL, close channel) |
-| `ssh_list_background` | Список всех job-ов |
+| `ssh_list_background` | Список всех job-ов с их подключением (`profile` — фильтр) |
 | `ssh_pending_confirmations` | Список ожидающих подтверждения |
 
 #### Файлы / SFTP
@@ -596,7 +615,7 @@ AI **не видит пароли проксей** при `ssh_proxy_status` —
 | `ssh_file_info` | stat (размер, права, owner, mtime) |
 | `ssh_mkdir` (recursive) / `ssh_rename` / `ssh_chmod` / `ssh_copy` | Стандартные операции |
 | `ssh_delete` + `ssh_delete_confirm` | Удаление с подтверждением |
-| `ssh_download_file` | Скачать в temp store, вернуть preview + ID |
+| `ssh_download_file` | Скачать в temp store, вернуть preview + ID; `as_base64: true` отдаёт весь файл inline в base64 до 2 MiB |
 | `ssh_temp_list` / `read` / `write` / `upload` / `delete` / `cleanup` / `path` | Работа с temp store |
 | `ssh_upload` | Файл → SFTP. Директория → tar.gz + upload + распаковка (`exclude` для паттернов) |
 
@@ -604,7 +623,7 @@ AI **не видит пароли проксей** при `ssh_proxy_status` —
 
 | Tool | Описание |
 |---|---|
-| `ssh_get_logs` | Лог текущей сессии. `limit` — последние N |
+| `ssh_get_logs` | Лог всех подключений, записи помечены `[имя]`. `limit` — последние N, `profile` — одно подключение |
 
 Также есть MCP-ресурс `ssh://logs`.
 

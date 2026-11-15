@@ -1,12 +1,12 @@
-import { readFileSync, existsSync, statSync, unlinkSync, createReadStream, createWriteStream, openSync, readSync, closeSync } from "fs";
+import { readFileSync, existsSync, statSync, unlinkSync, createReadStream, createWriteStream, openSync, readSync, closeSync, realpathSync } from "fs";
 import type { WriteStream } from "fs";
-import { join, dirname, basename, resolve } from "path";
+import { join, dirname, basename, resolve, sep } from "path";
 import { tmpdir } from "os";
 import { randomBytes } from "crypto";
 import { execFileSync } from "child_process";
 import type { SFTPWrapper, FileEntryWithStats } from "ssh2";
 import { addLog, DEFAULT_TRANSFER_TIMEOUT_MS } from "./state.js";
-import type { SessionCtx } from "./state.js";
+import type { Conn, SessionCtx } from "./state.js";
 import { getSftp, runScript } from "./ssh-core.js";
 import {
   getTempFile,
@@ -54,9 +54,9 @@ export class ReadBudget {
 
 /* Whole file into memory, for content returned inline. Remote mode caps it per call and per session; with `hold`
  * the bytes stay reserved after the read, until the caller releases it. */
-function readInline(ctx: SessionCtx, sftp: SFTPWrapper, remotePath: string, hold?: ReadBudget): Promise<Buffer> {
-  const perCall = ctx.mode === "remote" ? REMOTE_INLINE_MAX_BYTES : Infinity;
-  const budget = hold ?? new ReadBudget(ctx, "inline");
+function readInline(conn: Conn, sftp: SFTPWrapper, remotePath: string, hold?: ReadBudget): Promise<Buffer> {
+  const perCall = conn.ctx.mode === "remote" ? REMOTE_INLINE_MAX_BYTES : Infinity;
+  const budget = hold ?? new ReadBudget(conn.ctx, "inline");
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -89,7 +89,7 @@ function readInline(ctx: SessionCtx, sftp: SFTPWrapper, remotePath: string, hold
       if (!hold) budget.release();
       resolve(Buffer.concat(chunks));
     });
-    rs.on("error", (e: Error) => { addLog(ctx, "error", e.message); fail(e); });
+    rs.on("error", (e: Error) => { addLog(conn, "error", e.message); fail(e); });
   });
 }
 
@@ -97,14 +97,14 @@ function readInline(ctx: SessionCtx, sftp: SFTPWrapper, remotePath: string, hold
  * against the session's temp quota as it arrives (parallel downloads share it); the caller releases the budget once
  * the file is registered. */
 function downloadToFile(
-  ctx: SessionCtx,
+  conn: Conn,
   sftp: SFTPWrapper,
   remotePath: string,
   localPath: string
 ): Promise<{ size: number; isBinary: boolean; budget: ReadBudget }> {
-  const budget = new ReadBudget(ctx, "temp");
+  const budget = new ReadBudget(conn.ctx, "temp");
   /* Local fs errors carry the host's temp path, which a remote client must not learn. */
-  const localError = (e: Error) => (ctx.mode === "remote" ? new Error(`Cannot store ${remotePath} in the temp store`) : e);
+  const localError = (e: Error) => (conn.ctx.mode === "remote" ? new Error(`Cannot store ${remotePath} in the temp store`) : e);
   return new Promise((resolve, reject) => {
     let size = 0;
     let isBinary = false;
@@ -146,7 +146,7 @@ function downloadToFile(
       }
     });
     rs.on("end", () => { if (!settled) ws.end(); });
-    rs.on("error", (e: Error) => { addLog(ctx, "error", e.message); fail(e); });
+    rs.on("error", (e: Error) => { addLog(conn, "error", e.message); fail(e); });
     ws.on("error", (e: Error) => fail(localError(e)));
     ws.on("close", () => {
       if (settled || !ws.writableFinished) return;
@@ -172,44 +172,44 @@ function readHead(path: string, n: number): Buffer {
   }
 }
 
-function writeAll(ctx: SessionCtx, sftp: SFTPWrapper, remotePath: string, content: string | Buffer, mode?: number): Promise<void> {
+function writeAll(conn: Conn, sftp: SFTPWrapper, remotePath: string, content: string | Buffer, mode?: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const ws = sftp.createWriteStream(remotePath, mode === undefined ? undefined : { mode });
     ws.on("close", () => resolve());
-    ws.on("error", (e: Error) => { addLog(ctx, "error", e.message); reject(e); });
+    ws.on("error", (e: Error) => { addLog(conn, "error", e.message); reject(e); });
     ws.end(content);
   });
 }
 
 /* Wraps one callback-style SFTP call; logs failures the same way everywhere. */
-function sftpCall<T>(ctx: SessionCtx, fn: (sftp: SFTPWrapper, cb: (e: Error | null | undefined, v?: T) => void) => void): Promise<T> {
-  return getSftp(ctx).then(
+function sftpCall<T>(conn: Conn, fn: (sftp: SFTPWrapper, cb: (e: Error | null | undefined, v?: T) => void) => void): Promise<T> {
+  return getSftp(conn).then(
     (sftp) =>
       new Promise<T>((resolve, reject) => {
         fn(sftp, (e, v) => {
-          if (e) { addLog(ctx, "error", e.message); return reject(e); }
+          if (e) { addLog(conn, "error", e.message); return reject(e); }
           resolve(v as T);
         });
       })
   );
 }
 
-export async function sshUploadFile(ctx: SessionCtx, localContent: string, remotePath: string): Promise<string> {
-  await writeAll(ctx, await getSftp(ctx), remotePath, localContent);
-  addLog(ctx, "info", `File written: ${remotePath}`);
+export async function sshUploadFile(conn: Conn, localContent: string, remotePath: string): Promise<string> {
+  await writeAll(conn, await getSftp(conn), remotePath, localContent);
+  addLog(conn, "info", `File written: ${remotePath}`);
   return `✅ File written: ${remotePath}`;
 }
 
-export async function sshReadFile(ctx: SessionCtx, remotePath: string, hold?: ReadBudget): Promise<string> {
-  const content = (await readInline(ctx, await getSftp(ctx), remotePath, hold)).toString("utf-8");
-  addLog(ctx, "info", `File read: ${remotePath}`);
+export async function sshReadFile(conn: Conn, remotePath: string, hold?: ReadBudget): Promise<string> {
+  const content = (await readInline(conn, await getSftp(conn), remotePath, hold)).toString("utf-8");
+  addLog(conn, "info", `File read: ${remotePath}`);
   return content;
 }
 
 /* Remote mode: batch by batch through a handle, stopping at the entry or inline-size cap. */
-async function readDirBounded(ctx: SessionCtx, remotePath: string): Promise<{ list: FileEntryWithStats[]; truncated: boolean }> {
-  const sftp = await getSftp(ctx);
-  const handle = await sftpCall<Buffer>(ctx, (s, cb) => s.opendir(remotePath, cb as any));
+async function readDirBounded(conn: Conn, remotePath: string): Promise<{ list: FileEntryWithStats[]; truncated: boolean }> {
+  const sftp = await getSftp(conn);
+  const handle = await sftpCall<Buffer>(conn, (s, cb) => s.opendir(remotePath, cb as any));
   const list: FileEntryWithStats[] = [];
   let bytes = 0;
   try {
@@ -217,7 +217,7 @@ async function readDirBounded(ctx: SessionCtx, remotePath: string): Promise<{ li
       const batch = await new Promise<FileEntryWithStats[] | null>((resolve, reject) => {
         sftp.readdir(handle, (e: any, l) => {
           if (e && e.code === SFTP_STATUS_EOF) return resolve(null);
-          if (e) { addLog(ctx, "error", e.message); return reject(e); }
+          if (e) { addLog(conn, "error", e.message); return reject(e); }
           resolve(l);
         });
       });
@@ -234,27 +234,32 @@ async function readDirBounded(ctx: SessionCtx, remotePath: string): Promise<{ li
   }
 }
 
-export async function sshListDir(ctx: SessionCtx, remotePath: string): Promise<string> {
+export async function sshListDir(conn: Conn, remotePath: string): Promise<string> {
   const { list, truncated } =
-    ctx.mode === "remote"
-      ? await readDirBounded(ctx, remotePath)
-      : { list: await sftpCall<any[]>(ctx, (sftp, cb) => sftp.readdir(remotePath, cb as any)), truncated: false };
+    conn.ctx.mode === "remote"
+      ? await readDirBounded(conn, remotePath)
+      : { list: await sftpCall<any[]>(conn, (sftp, cb) => sftp.readdir(remotePath, cb as any)), truncated: false };
   const items = list.map((item) => {
     const type = item.attrs.isDirectory() ? "📁" : "📄";
     const size = item.attrs.size;
     const mtime = new Date(item.attrs.mtime * 1000).toISOString().substring(0, 10);
     return `${type} ${item.filename.padEnd(40)} ${String(size).padStart(10)} ${mtime}`;
   });
-  addLog(ctx, "info", `Directory read: ${remotePath} (${list.length}${truncated ? ", truncated" : ""})`);
+  addLog(conn, "info", `Directory read: ${remotePath} (${list.length}${truncated ? ", truncated" : ""})`);
   const text = items.join("\n") || "(empty directory)";
   return truncated
     ? `${text}\n\n... listing cut at ${list.length} entries; list the rest with ssh_execute (ls | head, find -maxdepth 1) ...`
     : text;
 }
 
+/** Largest file ssh_download_file returns inline as base64 (a third larger on the way out), in both modes. */
+export const INLINE_BASE64_MAX_BYTES = REMOTE_INLINE_MAX_BYTES;
+
 export interface DownloadResult {
   tempFile: TempFile;
   preview: string;
+  /** preview is the whole file as base64. */
+  base64?: boolean;
 }
 
 /* Session logs reach the client; a remote client gets the temp id, not the host's filesystem path. */
@@ -262,20 +267,37 @@ function tempLabel(ctx: SessionCtx, tf: TempFile): string {
   return ctx.mode === "remote" ? `temp ${tf.id}` : tf.localPath;
 }
 
-export async function sshDownloadFile(ctx: SessionCtx, remotePath: string, asBase64 = false, hold?: ReadBudget): Promise<DownloadResult> {
-  const serverHost = ctx.session?.config.host || "unknown";
-  const sftp = await getSftp(ctx);
+export async function sshDownloadFile(conn: Conn, remotePath: string, asBase64 = false, hold?: ReadBudget): Promise<DownloadResult> {
+  const ctx = conn.ctx;
+  const serverHost = String(conn.session?.config.host || "unknown");
+  const sftp = await getSftp(conn);
   const slot = prepareTempFile(ctx, remotePath);
-  const { size, isBinary, budget } = await downloadToFile(ctx, sftp, remotePath, slot.localPath);
+  const { size, isBinary, budget } = await downloadToFile(conn, sftp, remotePath, slot.localPath);
   let tempFile: TempFile;
   try {
     tempFile = addTempFile(ctx, slot, remotePath, serverHost, size, isBinary);
+    tempFile.connection = conn.name;
+    tempFile.connectionKey = conn.key;
+    const cfg = conn.session?.config;
+    if (cfg) tempFile.endpoint = `${cfg.username}@${cfg.host}:${cfg.port || 22}`;
   } finally {
     budget.release();
   }
-  addLog(ctx, "info", `Downloaded: ${remotePath} → ${tempLabel(ctx, tempFile)} (${size}b)`);
-  if (asBase64) return { tempFile, preview: `[BASE64: ${Math.ceil(size / 3) * 4} chars]` };
-  if (isBinary) return { tempFile, preview: `[BINARY: ${size} bytes — base64 in temp]` };
+  addLog(conn, "info", `Downloaded: ${remotePath} → ${tempLabel(ctx, tempFile)} (${size}b)`);
+  const elsewhere =
+    ctx.mode === "remote"
+      ? "read it in parts on the server with ssh_execute (dd or split, then base64)"
+      : "use the local path above, or ssh_temp_read {temp_id, as_base64: true}";
+  if (asBase64) {
+    if (size > INLINE_BASE64_MAX_BYTES) {
+      return { tempFile, preview: `[base64 not returned inline: ${formatBytes(size)} is over the ${formatBytes(INLINE_BASE64_MAX_BYTES)} inline limit. The file is in the temp store; ${elsewhere}]` };
+    }
+    if (hold && !hold.take(size)) {
+      return { tempFile, preview: `[base64 skipped: ${inlineBusyMessage()}; read it with ssh_temp_read {temp_id, as_base64: true}]` };
+    }
+    return { tempFile, preview: readHead(tempFile.localPath, size).toString("base64"), base64: true };
+  }
+  if (isBinary) return { tempFile, preview: `[BINARY: ${size} bytes, not shown; pass as_base64: true for the content (up to ${formatBytes(INLINE_BASE64_MAX_BYTES)}), or ssh_temp_read {temp_id, as_base64: true}]` };
   /* Remote mode returns at most the inline cap; the rest stays in the temp store. */
   const headBytes = ctx.mode === "remote" ? Math.min(size, REMOTE_INLINE_MAX_BYTES) : size;
   if (hold && !hold.take(headBytes)) {
@@ -294,7 +316,7 @@ export async function sshDownloadFile(ctx: SessionCtx, remotePath: string, asBas
 }
 
 /* Streams a temp file to the server, so an upload never holds the whole file in memory. */
-function uploadFile(ctx: SessionCtx, sftp: SFTPWrapper, localPath: string, remotePath: string): Promise<number> {
+function uploadFile(conn: Conn, sftp: SFTPWrapper, localPath: string, remotePath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     let size = 0;
     let settled = false;
@@ -308,24 +330,24 @@ function uploadFile(ctx: SessionCtx, sftp: SFTPWrapper, localPath: string, remot
     const ws = sftp.createWriteStream(remotePath);
     rs.on("data", (c: Buffer) => { size += c.length; });
     rs.on("error", (e: Error) => { ws.destroy(); done(e); });
-    ws.on("error", (e: Error) => { addLog(ctx, "error", e.message); rs.destroy(); done(e); });
+    ws.on("error", (e: Error) => { addLog(conn, "error", e.message); rs.destroy(); done(e); });
     ws.on("close", () => done());
     rs.pipe(ws);
   });
 }
 
-export async function sshUploadFromTemp(ctx: SessionCtx, tempId: string, remotePath?: string): Promise<string> {
-  const tempFile = getTempFile(ctx, tempId);
+export async function sshUploadFromTemp(conn: Conn, tempId: string, remotePath?: string): Promise<string> {
+  const tempFile = getTempFile(conn.ctx, tempId);
   if (!tempFile) throw new Error(`Temp file "${tempId}" not found`);
   if (!existsSync(tempFile.localPath)) throw new Error("Failed to read temp file");
   const targetPath = remotePath || tempFile.remotePath;
-  const size = await uploadFile(ctx, await getSftp(ctx), tempFile.localPath, targetPath);
-  addLog(ctx, "info", `Uploaded from temp: ${tempLabel(ctx, tempFile)} → ${targetPath}`);
-  return `✅ Uploaded: ${targetPath} (${size}b)`;
+  const size = await uploadFile(conn, await getSftp(conn), tempFile.localPath, targetPath);
+  addLog(conn, "info", `Uploaded from temp: ${tempLabel(conn.ctx, tempFile)} → ${targetPath}`);
+  return `✅ Uploaded: ${targetPath} on ${conn.name} (${size}b)`;
 }
 
-export async function sshFileInfo(ctx: SessionCtx, remotePath: string): Promise<string> {
-  const stats = await sftpCall<any>(ctx, (sftp, cb) => sftp.stat(remotePath, cb as any));
+export async function sshFileInfo(conn: Conn, remotePath: string): Promise<string> {
+  const stats = await sftpCall<any>(conn, (sftp, cb) => sftp.stat(remotePath, cb as any));
   const type = stats.isDirectory()
     ? "📁 Directory"
     : stats.isFile()
@@ -336,7 +358,7 @@ export async function sshFileInfo(ctx: SessionCtx, remotePath: string): Promise<
   const mode = (stats.mode & 0o777).toString(8).padStart(3, "0");
   const mtime = new Date(stats.mtime * 1000).toISOString();
   const atime = new Date(stats.atime * 1000).toISOString();
-  addLog(ctx, "info", `Stat: ${remotePath}`);
+  addLog(conn, "info", `Stat: ${remotePath}`);
   return [
     `📋 ${remotePath}`,
     ``,
@@ -349,10 +371,10 @@ export async function sshFileInfo(ctx: SessionCtx, remotePath: string): Promise<
   ].join("\n");
 }
 
-export async function sshMkdir(ctx: SessionCtx, remotePath: string, recursive = false): Promise<string> {
+export async function sshMkdir(conn: Conn, remotePath: string, recursive = false): Promise<string> {
   /* OpenSSH reports EEXIST as a generic "Failure", so an existing directory is detected by stat, not by message. */
   const tryMkdir = (path: string) =>
-    sftpCall<void>(ctx, (sftp, cb) =>
+    sftpCall<void>(conn, (sftp, cb) =>
       sftp.mkdir(path, (mkErr: any) => {
         if (!mkErr) return cb(null);
         sftp.stat(path, (stErr, st) => cb(!stErr && st.isDirectory() ? null : mkErr));
@@ -360,7 +382,7 @@ export async function sshMkdir(ctx: SessionCtx, remotePath: string, recursive = 
     );
   if (!recursive) {
     await tryMkdir(remotePath);
-    addLog(ctx, "info", `mkdir: ${remotePath}`);
+    addLog(conn, "info", `mkdir: ${remotePath}`);
     return `✅ Created: ${remotePath}`;
   }
   const norm = remotePath.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -372,57 +394,78 @@ export async function sshMkdir(ctx: SessionCtx, remotePath: string, recursive = 
     acc = acc ? acc + "/" + part : prefix + part;
     await tryMkdir(acc);
   }
-  addLog(ctx, "info", `mkdir -p: ${remotePath}`);
+  addLog(conn, "info", `mkdir -p: ${remotePath}`);
   return `✅ Created: ${remotePath}`;
 }
 
-export async function sshRename(ctx: SessionCtx, oldPath: string, newPath: string): Promise<string> {
-  await sftpCall<void>(ctx, (sftp, cb) => sftp.rename(oldPath, newPath, cb));
-  addLog(ctx, "info", `rename: ${oldPath} → ${newPath}`);
+export async function sshRename(conn: Conn, oldPath: string, newPath: string): Promise<string> {
+  await sftpCall<void>(conn, (sftp, cb) => sftp.rename(oldPath, newPath, cb));
+  addLog(conn, "info", `rename: ${oldPath} → ${newPath}`);
   return `✅ ${oldPath} → ${newPath}`;
 }
 
-export async function sshChmod(ctx: SessionCtx, remotePath: string, mode: string): Promise<string> {
+export async function sshChmod(conn: Conn, remotePath: string, mode: string): Promise<string> {
   const modeNum = parseInt(mode, 8);
   if (isNaN(modeNum) || modeNum < 0 || modeNum > 0o777) {
     throw new Error(`Invalid mode: ${mode}. Use octal (e.g. 755).`);
   }
-  await sftpCall<void>(ctx, (sftp, cb) => sftp.chmod(remotePath, modeNum, cb));
-  addLog(ctx, "info", `chmod ${mode}: ${remotePath}`);
+  await sftpCall<void>(conn, (sftp, cb) => sftp.chmod(remotePath, modeNum, cb));
+  addLog(conn, "info", `chmod ${mode}: ${remotePath}`);
   return `✅ Mode ${mode}: ${remotePath}`;
 }
 
-export async function sshDelete(ctx: SessionCtx, remotePath: string, isDirectory = false): Promise<string> {
-  await sftpCall<void>(ctx, (sftp, cb) => (isDirectory ? sftp.rmdir(remotePath, cb) : sftp.unlink(remotePath, cb)));
-  addLog(ctx, "info", `delete: ${remotePath}`);
+export async function sshDelete(conn: Conn, remotePath: string, isDirectory = false): Promise<string> {
+  await sftpCall<void>(conn, (sftp, cb) => (isDirectory ? sftp.rmdir(remotePath, cb) : sftp.unlink(remotePath, cb)));
+  addLog(conn, "info", `delete: ${remotePath}`);
   return `✅ Deleted: ${remotePath}`;
 }
 
 /* Stays under the tool-level transfer deadline so the command, not the whole session, is what times out. */
-async function runChecked(ctx: SessionCtx, script: string, timeoutMs = DEFAULT_TRANSFER_TIMEOUT_MS - 10_000): Promise<void> {
-  const r = await runScript(ctx, script, timeoutMs);
-  if (r.timedOut) throw new Error(`Timed out after ${r.limitMs} ms: ${script}`);
+async function runChecked(conn: Conn, script: string, timeoutMs = DEFAULT_TRANSFER_TIMEOUT_MS - 10_000): Promise<void> {
+  const r = await runScript(conn, script, timeoutMs);
+  /* Not the script: it can carry secrets, and this message reaches the session log. */
+  if (r.timedOut) throw new Error(`Timed out after ${r.limitMs} ms`);
   if (r.code !== 0) throw new Error(r.stderr.trim() || r.stdout.trim() || `exit code ${r.code}`);
 }
 
-export async function sshCopy(ctx: SessionCtx, srcPath: string, destPath: string): Promise<string> {
-  await runChecked(ctx, `cp -r -- ${shellQuote(srcPath)} ${shellQuote(destPath)}`);
-  addLog(ctx, "info", `cp: ${srcPath} → ${destPath}`);
+export async function sshCopy(conn: Conn, srcPath: string, destPath: string): Promise<string> {
+  await runChecked(conn, `cp -r -- ${shellQuote(srcPath)} ${shellQuote(destPath)}`);
+  addLog(conn, "info", `cp: ${srcPath} → ${destPath}`);
   return `✅ ${srcPath} → ${destPath}`;
 }
 
-export async function sshUpload(ctx: SessionCtx, localPathArg: string, remotePath: string, exclude: string[] = []): Promise<string> {
-  if (!ctx.session?.connected) throw new Error("No active SSH connection");
+/* The profile store and its key files must never reach a server: ssh_read_file would hand every stored secret to
+ * the model. Also refuses the store's lock/temp siblings and any directory containing one of them. */
+function assertNotSecret(ctx: SessionCtx, localPath: string, isDirectory: boolean): void {
+  const norm = (p: string) => {
+    let r = resolve(p);
+    try { r = realpathSync(r); } catch { /* not there (yet): compare the path as given */ }
+    return process.platform === "win32" ? r.toLowerCase() : r;
+  };
+  const target = norm(localPath);
+  for (const raw of ctx.store.protectedPaths?.() ?? []) {
+    const p = norm(raw);
+    const sibling = target.startsWith(p + ".") && /\.(lock|tmp)$/.test(target);
+    const inside = isDirectory && p.startsWith(target.endsWith(sep) ? target : target + sep);
+    if (target === p || sibling || inside) {
+      throw new Error(`Refusing to upload ${localPath}: it is or contains the profile store or a profile's key file`);
+    }
+  }
+}
+
+export async function sshUpload(conn: Conn, localPathArg: string, remotePath: string, exclude: string[] = []): Promise<string> {
+  if (!conn.session?.connected) throw new Error(`No active SSH connection to ${conn.name}`);
   const deadlineAt = Date.now() + DEFAULT_TRANSFER_TIMEOUT_MS - 10_000;
   const localPath = resolve(localPathArg);
   assertNotUnc(localPath, "upload");
   if (!existsSync(localPath)) throw new Error(`Local path not found: ${localPath}`);
   const stats = statSync(localPath);
+  assertNotSecret(conn.ctx, localPath, stats.isDirectory());
 
   if (stats.isFile()) {
     const buffer = readFileSync(localPath);
-    await writeAll(ctx, await getSftp(ctx), remotePath, buffer);
-    addLog(ctx, "info", `File uploaded: ${localPath} → ${remotePath} (${buffer.length}b)`);
+    await writeAll(conn, await getSftp(conn), remotePath, buffer);
+    addLog(conn, "info", `File uploaded: ${localPath} → ${remotePath} (${buffer.length}b)`);
     return `✅ File uploaded: ${localPath} → ${remotePath} (${buffer.length}b)`;
   }
   if (!stats.isDirectory()) throw new Error(`Not a file or directory: ${localPath}`);
@@ -432,19 +475,19 @@ export async function sshUpload(ctx: SessionCtx, localPathArg: string, remotePat
   const tempTarPath = join(tmpdir(), tarName);
   const remoteTarPath = `/tmp/${tarName}`;
   try {
-    addLog(ctx, "info", `tar: ${localPath}`);
+    addLog(conn, "info", `tar: ${localPath}`);
     execFileSync(
       "tar",
       ["-czf", tarName, ...exclude.map((p) => `--exclude=${p}`), "-C", dirname(localPath), "--", basename(localPath)],
       { cwd: tmpdir(), timeout: 120_000, stdio: "pipe" }
     );
     const tarBuffer = readFileSync(tempTarPath);
-    addLog(ctx, "info", `Archive: ${(tarBuffer.length / 1024).toFixed(1)} KB`);
-    await writeAll(ctx, await getSftp(ctx), remoteTarPath, tarBuffer, 0o600);
+    addLog(conn, "info", `Archive: ${(tarBuffer.length / 1024).toFixed(1)} KB`);
+    await writeAll(conn, await getSftp(conn), remoteTarPath, tarBuffer, 0o600);
     const dest = shellQuote(remotePath);
     const tarQ = shellQuote(remoteTarPath);
-    await runChecked(ctx, `mkdir -p -- ${dest} && tar -xzf ${tarQ} -C ${dest} --strip-components=1; rc=$?; rm -f ${tarQ}; exit $rc`, Math.max(deadlineAt - Date.now(), 1_000));
-    addLog(ctx, "info", `Directory uploaded: ${localPath} → ${remotePath}`);
+    await runChecked(conn, `mkdir -p -- ${dest} && tar -xzf ${tarQ} -C ${dest} --strip-components=1; rc=$?; rm -f ${tarQ}; exit $rc`, Math.max(deadlineAt - Date.now(), 1_000));
+    addLog(conn, "info", `Directory uploaded: ${localPath} → ${remotePath}`);
     return [
       `✅ Directory uploaded: ${localPath} → ${remotePath}`,
       `📦 Archive size: ${(tarBuffer.length / 1024).toFixed(1)} KB`,

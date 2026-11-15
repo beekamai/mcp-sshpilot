@@ -50,6 +50,10 @@ export interface ProfileStore {
   dispose?(): void;
   /** load + mutate + save as one step against other writers; saves only when mutate changed something. */
   update?<T>(mutate: (cfg: ServersConfig) => T): T;
+  /** Local files holding this store's secrets (the config itself, key files); ssh_upload refuses them. */
+  protectedPaths?(): string[];
+  /** Remote device sessions: a one-time code (10 minutes, single use) that approves a Claude connector in place of
+   * a device token. expiresAt is ISO 8601. */
 }
 
 /** Read-modify-write of the profiles; atomic where the store supports it (the vault), load + save otherwise. */
@@ -180,6 +184,17 @@ export class FileProfileStore implements ProfileStore {
 
   describe(): string {
     return this.path;
+  }
+
+  protectedPaths(): string[] {
+    const out = [this.path];
+    try {
+      for (const p of this.load().servers) {
+        if (!p.privateKeyPath) continue;
+        try { out.push(this.resolveKeyPath(p.privateKeyPath)); } catch { /* a UNC path is refused on use anyway */ }
+      }
+    } catch { /* a broken config still protects itself */ }
+    return out;
   }
 
   resolveKey(profile: ServerProfile): string | undefined {

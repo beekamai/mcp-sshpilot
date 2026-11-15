@@ -36,13 +36,16 @@ export interface LogEntry {
   timestamp: Date;
   type: "command" | "output" | "error" | "info" | "warning";
   content: string;
+  /** Name of the connection the entry is about; undefined for session-wide entries. */
+  conn?: string;
+  connKey?: string;
 }
 
 export interface SSHSession {
   client: Client;
+  /** Profile connections keep no password, key or passphrase here; reconnects re-read them from the store. */
   config: ConnectConfig;
   connected: boolean;
-  logs: LogEntry[];
   startTime: Date;
   proxyUsed?: ProxyConfig;
   /** Random per connection; confirmations are bound to it so they cannot fire on another server. */
@@ -59,7 +62,10 @@ export interface SSHSession {
 
 /** Parameters of the last successful connect, replayed by ensureConnected() after the session drops. */
 export interface LastConnect {
+  /** Without credentials when `profile` is set. */
   config: ConnectConfig;
+  /** Saved profile the connection was made from; a reconnect re-reads its credentials by this name. */
+  profile?: string;
   proxy?: ProxyConfig;
   label: string;
   hostKeySha256?: string;
@@ -72,6 +78,8 @@ export interface PendingConfirmation {
   command: string;
   reason: string;
   createdAt: Date;
+  /** Key of the connection it was issued on; it only ever runs there. */
+  conn: string;
   sessionId: string;
   target: string;
   timeoutMs?: number;
@@ -83,6 +91,7 @@ export interface PendingDeleteConfirmation {
   path: string;
   isDirectory: boolean;
   createdAt: Date;
+  conn: string;
   sessionId: string;
   target: string;
 }
@@ -92,6 +101,11 @@ export interface TempFile {
   localPath: string;
   remotePath: string;
   serverHost: string;
+  /** Name of the connection it was downloaded through; ssh_temp_upload without profile goes back there. */
+  connection?: string;
+  connectionKey?: string;
+  /** user@host:port that connection pointed at; an upload back there is refused if the profile moved since. */
+  endpoint?: string;
   filename: string;
   size: number;
   isBinary: boolean;
@@ -100,6 +114,9 @@ export interface TempFile {
 
 export interface BackgroundJob {
   id: string;
+  /** Name and key of the connection the job runs on. */
+  conn: string;
+  connKey: string;
   command: string;
   startedAt: Date;
   stdout: OutputTail;

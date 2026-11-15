@@ -21,8 +21,9 @@ export const PACKAGE_VERSION: string = __pkg.version;
 
 export interface ServerHooks {
   /** Runs around every tool call's handler (remote mode: concurrency cap and audit line), so it sees calls the
-   * client cancelled too, for as long as they really run. */
-  toolCall?<T>(name: string, signal: AbortSignal, run: () => Promise<T>): Promise<T>;
+   * client cancelled too, for as long as they really run. args are the call's raw arguments (they can hold
+   * passwords: describe them with describeCallTarget, never log them). */
+  toolCall?<T>(name: string, args: unknown, signal: AbortSignal, run: () => Promise<T>): Promise<T>;
 }
 
 /** Every handler closes over the given ctx, never over module state. */
@@ -37,8 +38,9 @@ export function createMcpServer(ctx: SessionCtx, hooks: ServerHooks = {}): Serve
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-    const run = () => handleToolCall(ctx, request.params.name, request.params.arguments);
-    return hooks.toolCall ? hooks.toolCall(request.params.name, extra.signal, run) : run();
+    const { name, arguments: args } = request.params;
+    const run = () => handleToolCall(ctx, name, args);
+    return hooks.toolCall ? hooks.toolCall(name, args, extra.signal, run) : run();
   });
 
   server.setRequestHandler(ListResourcesRequestSchema, async () => ({
@@ -46,7 +48,7 @@ export function createMcpServer(ctx: SessionCtx, hooks: ServerHooks = {}): Serve
       {
         uri: "ssh://logs",
         name: "SSH Session Logs",
-        description: "Current SSH session logs",
+        description: "Session logs of every SSH connection, each entry tagged with its connection name",
         mimeType: "text/plain",
       },
     ],
@@ -55,7 +57,7 @@ export function createMcpServer(ctx: SessionCtx, hooks: ServerHooks = {}): Serve
   server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     const { uri } = request.params;
     if (uri === "ssh://logs") {
-      const logs = ctx.session ? formatLogs(ctx.session.logs) : "No active session";
+      const logs = ctx.logs.length > 0 ? formatLogs(ctx.logs) : "No log entries yet";
       return { contents: [{ uri, mimeType: "text/plain", text: logs }] };
     }
     throw new Error(`Unknown resource: ${uri}`);

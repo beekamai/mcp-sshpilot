@@ -12,6 +12,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { ErrorCode, McpError, isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { ServerHooks } from "./mcp-server.js";
 import { createCtx, destroyCtx } from "./state.js";
+import { describeCallTarget } from "./handlers.js";
 import type { SessionCtx } from "./state.js";
 import {
   authenticate,
@@ -42,6 +43,10 @@ export interface HttpLimits {
   sweepIntervalMs: number;
   /** Tool calls of one session whose handler is still running (cancelled ones included); a POST that would exceed it gets 429. */
   maxCallsPerSession: number;
+  /** Requests in flight per device or grant (open GET streams included); past it 429. */
+  maxRequestsPerPrincipal: number;
+  /** Requests in flight of all connector grants together, so devices always keep connections. */
+  maxGrantRequests: number;
   authFailLimit: number;
   authFailWindowMs: number;
   /** Upper bound of the failed-auth table; the oldest entries are evicted beyond it. */
@@ -59,6 +64,8 @@ export const DEFAULT_HTTP_LIMITS: HttpLimits = {
   idleTimeoutMs: 30 * 60 * 1000,
   sweepIntervalMs: 30_000,
   maxCallsPerSession: 32,
+  maxRequestsPerPrincipal: 64,
+  maxGrantRequests: 128,
   authFailLimit: 10,
   authFailWindowMs: 5 * 60 * 1000,
   rateLimitEntries: 4096,
@@ -86,6 +93,9 @@ export interface HttpServerOptions {
   trustProxy?: boolean;
   /** Lets profiles and proxies point at loopback/link-local addresses of this host. Default false. */
   allowLocalTargets?: boolean;
+  /** Lets a session pin a profile's host key on its first connection (trust on first use). Default false: unpinned
+   * profiles are refused until the owner pins them out of band. */
+  allowTofu?: boolean;
   /** Closes everything on SIGINT/SIGTERM and exits. Default true. */
   handleSignals?: boolean;
   /** Operational and audit lines. Default: stderr. */
@@ -121,6 +131,8 @@ interface OpenRequest {
 
 interface RunningCall {
   tool: string;
+  /* Never logged: may hold passwords. Only describeCallTarget reads it. */
+  args: unknown;
   start: number;
 }
 
@@ -144,6 +156,8 @@ interface Session {
   running: number;
   calls: Set<RunningCall>;
   open: Map<RequestId, OpenRequest>;
+  /* Responses still being written for this session. */
+  responses: Set<ServerResponse>;
   closed: boolean;
 }
 
@@ -173,6 +187,7 @@ const BODY_UNSUPPORTED_MEDIA = rpcError(-32000, "Unsupported Media Type: Content
 const BODY_PARSE_ERROR = rpcError(-32700, "Parse error: Invalid JSON");
 const BODY_INTERNAL = rpcError(-32603, "Internal error");
 const BODY_SERVER_BUSY = rpcError(-32000, "Server busy, retry shortly");
+const BODY_BATCH = rpcError(-32600, "Invalid Request: send one request per POST (JSON-RPC batches are not supported)");
 /* A client that stops reading keeps its response, and every result queued behind it, in memory until it goes away. */
 const DRAIN_TIMEOUT_MS = 60_000;
 const WRITE_SLICE_BYTES = 64 * 1024;
@@ -349,6 +364,12 @@ function discardBody(req: IncomingMessage, limit: number): void {
   req.resume();
 }
 
+/* JSON-RPC batches are gone from the MCP spec since 2025-06-18. With one, a cancelled request leaves the results of
+ * its siblings queued in the SDK until the session ends, so remote mode takes at most one request per POST. */
+function refuseBatch(body: unknown): void {
+  if (Array.isArray(body) && (requestIds(body)?.length ?? 2) > 1) throw new HttpError(400, BODY_BATCH);
+}
+
 function countToolCalls(body: unknown): number {
   const isCall = (m: unknown): boolean => typeof m === "object" && m !== null && (m as { method?: unknown }).method === "tools/call" && "id" in m;
   return Array.isArray(body) ? body.filter(isCall).length : isCall(body) ? 1 : 0;
@@ -492,9 +513,8 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
   let oauth: OAuthEndpoints | null = null;
   let closing: Promise<void> | null = null;
 
-  const audit = (s: Session, tool: string, ms: number, outcome: string): void => {
-    const cfg = s.ctx.session?.config ?? s.ctx.lastConnect?.config;
-    const target = cfg?.host ? `${clean(cfg.username)}@${clean(cfg.host, 255)}:${Number(cfg.port) || 22}` : "-";
+  const audit = (s: Session, tool: string, args: unknown, ms: number, outcome: string): void => {
+    const target = clean(describeCallTarget(s.ctx, args, tool), 300);
     log(`${new Date().toISOString()} audit device=${clean(s.deviceName)} session=${s.id.slice(0, 8)} tool=${clean(tool)} target=${target} ms=${ms} ${outcome}`);
   };
 
@@ -503,9 +523,12 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
     s.closed = true;
     if (sessions.get(s.id) === s) sessions.delete(s.id);
     const now = Date.now();
-    for (const call of s.calls) audit(s, call.tool, now - call.start, "aborted");
+    for (const call of s.calls) audit(s, call.tool, call.args, now - call.start, "aborted");
     s.calls.clear();
     s.open.clear();
+    /* An open response would otherwise keep its queued results until the client goes away. */
+    for (const r of s.responses) r.destroy();
+    s.responses.clear();
     /* Drops the SSH connection, background jobs, temp dir and zero-fills the vault key. */
     destroyCtx(s.ctx);
     s.server.close().catch(() => {});
@@ -599,13 +622,13 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
 
   /* Counts and audits around the real handler, not transport messages: a reused id or a cancellation cannot hide
    * a running call from the cap or from the audit log. */
-  const trackCall = async <T>(s: Session, tool: string, signal: AbortSignal, run: () => Promise<T>): Promise<T> => {
+  const trackCall = async <T>(s: Session, tool: string, args: unknown, signal: AbortSignal, run: () => Promise<T>): Promise<T> => {
     /* The hard cap; the 429 in handleMcp is the cheap early answer, this one also holds for racing POSTs. */
     if (s.running >= limits.maxCallsPerSession) {
-      audit(s, tool, 0, "refused");
+      audit(s, tool, args, 0, "refused");
       throw new McpError(ErrorCode.InvalidRequest, "Too many concurrent tool calls in this session");
     }
-    const call: RunningCall = { tool, start: Date.now() };
+    const call: RunningCall = { tool, args, start: Date.now() };
     s.running++;
     s.calls.add(call);
     let outcome = "error";
@@ -616,7 +639,7 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
     } finally {
       s.running--;
       /* Gone from the set: closeSession already audited it as aborted. */
-      if (s.calls.delete(call)) audit(s, tool, Date.now() - call.start, signal.aborted ? "cancelled" : outcome);
+      if (s.calls.delete(call)) audit(s, tool, args, Date.now() - call.start, signal.aborted ? "cancelled" : outcome);
     }
   };
 
@@ -673,11 +696,12 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
       deviceId: auth.deviceId,
       scoped: auth.grantId !== undefined,
       allowLocalTargets: opts.allowLocalTargets === true,
+      allowTofu: opts.allowTofu === true,
     });
     let server: Server;
     let self: Session | undefined;
     const hooks: ServerHooks = {
-      toolCall: (tool, signal, run) => (self ? trackCall(self, tool, signal, run) : run()),
+      toolCall: (tool, args, signal, run) => (self ? trackCall(self, tool, args, signal, run) : run()),
     };
     try {
       server = opts.buildServer(ctx, hooks);
@@ -698,6 +722,7 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
       running: 0,
       calls: new Set(),
       open: new Map(),
+      responses: new Set(),
       closed: false,
     };
     self = s;
@@ -713,9 +738,30 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
     return s;
   };
 
+  /* In-flight requests per principal (device or grant), so that one of them, or the connector grants together,
+   * cannot hold every server connection and starve the owner's devices. Released when the response closes. */
+  const requestSlots = new Map<string, number>();
+  let grantRequests = 0;
+  const takeRequestSlot = (p: Principal, res: ServerResponse): void => {
+    const held = requestSlots.get(p.deviceId) ?? 0;
+    if (held >= limits.maxRequestsPerPrincipal || (p.grantId && grantRequests >= limits.maxGrantRequests)) {
+      throw new HttpError(429, BODY_TOO_MANY_REQUESTS, { "Retry-After": "1" });
+    }
+    requestSlots.set(p.deviceId, held + 1);
+    if (p.grantId) grantRequests++;
+    res.once("close", () => {
+      const left = (requestSlots.get(p.deviceId) ?? 1) - 1;
+      if (left > 0) requestSlots.set(p.deviceId, left);
+      else requestSlots.delete(p.deviceId);
+      if (p.grantId) grantRequests--;
+    });
+  };
+
   const forward = async (s: Session, req: IncomingMessage, res: ServerResponse, pathname: string, parsedBody?: unknown): Promise<void> => {
     const counted = req.method !== "GET";
     if (counted) s.inflight++;
+    s.responses.add(res);
+    res.once("close", () => s.responses.delete(res));
     s.lastSeen = Date.now();
     /* Callers checked these ids against s.open with no await in between. */
     const ids = parsedBody === undefined ? [] : requestIds(parsedBody) ?? [];
@@ -789,6 +835,7 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
     /* From here the key is ours: it either moves into a new session's store or is zeroed in finally. */
     let dek: Buffer | null = auth.key;
     try {
+      takeRequestSlot(auth, res);
       const sessionId = headerValue(req, "mcp-session-id");
       if (sessionId !== undefined) {
         dek.fill(0);
@@ -801,6 +848,7 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
           body = await parseJsonBody(req);
           /* Reading the body can take up to the request timeout; a device revoked meanwhile must not get it run. */
           enforceRevocations();
+          refuseBatch(body);
           const ids = requestIds(body);
           if (!ids || ids.some((id) => s.open.has(id))) throw new HttpError(400, BODY_DUPLICATE_ID);
           if (!s.closed && s.running + countToolCalls(body) > limits.maxCallsPerSession) {
@@ -816,6 +864,7 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
       const body = await parseJsonBody(req);
       const isInit = Array.isArray(body) ? body.some((b) => isInitializeRequest(b)) : isInitializeRequest(body);
       if (!isInit) throw new HttpError(400, BODY_SESSION_REQUIRED);
+      refuseBatch(body);
       if (!requestIds(body)) throw new HttpError(400, BODY_DUPLICATE_ID);
       if (countToolCalls(body) > limits.maxCallsPerSession) throw new HttpError(429, BODY_TOO_MANY_CALLS, { "Retry-After": "1" });
       const liveKey = liveKeyOf(auth);

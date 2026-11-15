@@ -1,8 +1,21 @@
+/* Connection-bound tools take this; resolution is in handlers.resolveTarget. */
+const PROFILE_PROPERTY = {
+  type: "string",
+  description:
+    "Connection to act on: a saved profile name (connected on first use) or an open connection's name as ssh_status " +
+    "lists it. Required while more than one connection is open; omitted, the only open connection is used.",
+};
+
+const CONFIRM_PROFILE_PROPERTY = {
+  type: "string",
+  description: "Optional check: the connection the confirmation was issued on. It only ever runs there; another value is refused.",
+};
+
 export const TOOL_DEFINITIONS = [
   {
     name: "ssh_connect",
     description:
-      "Connect over SSH with explicit parameters. If `proxy` is provided, the connection goes through it. Otherwise the runtime override / global config proxy is applied (see ssh_proxy_status).",
+      "Connect over SSH with explicit parameters. If `proxy` is provided, the connection goes through it. Otherwise the runtime override / global config proxy is applied (see ssh_proxy_status). The connection is named user@host:port; pass that as `profile` to other tools while several connections are open.",
     inputSchema: {
       type: "object",
       properties: {
@@ -31,7 +44,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: "ssh_connect_profile",
     description:
-      "Connect using a saved profile from servers.json. The AI does NOT see credentials — only the profile name. Proxy precedence: runtime override → server.proxy → config.proxy. server.proxy=null forces direct connection for this server. The server's host key is pinned on the first connect (trust on first use); a different key is refused. On a mismatch, stop and tell the user: never re-pin a key you cannot verify yourself.",
+      "Connect using a saved profile from servers.json. The AI does NOT see credentials — only the profile name. Several profiles can be connected at once (each connection is named after its profile); while more than one is open, connection tools need `profile`. Calling any connection tool with `profile` also connects that profile on first use, so this call is optional. Proxy precedence: runtime override → server.proxy → config.proxy. server.proxy=null forces direct connection for this server. The server's host key is pinned on the first connect (trust on first use); a different key is refused. On a mismatch, stop and tell the user: never re-pin a key you cannot verify yourself.",
     inputSchema: {
       type: "object",
       properties: { profile_name: { type: "string" } },
@@ -153,7 +166,7 @@ export const TOOL_DEFINITIONS = [
       "Execute a command. Dangerous commands require confirmation. Hard timeout (default 5 min): if the command forks a background process inheriting stdout, the channel will not close and you will receive partial output. For long-running/daemon commands use ssh_execute_background, or redirect descriptors: `cmd > /dev/null 2>&1 < /dev/null & disown`.",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: PROFILE_PROPERTY,
         command: { type: "string" },
         timeout_ms: { type: "number", description: "Timeout in ms (default 300000)" },
       },
@@ -162,10 +175,10 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "ssh_execute_dangerous",
-    description: "Confirm or cancel a dangerous command via confirmation_id.",
+    description: "Confirm or cancel a dangerous command via confirmation_id. It runs on the connection it was issued on, whatever else is open.",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: CONFIRM_PROFILE_PROPERTY,
         confirmation_id: { type: "string" },
         confirm: { type: "boolean" },
       },
@@ -178,7 +191,7 @@ export const TOOL_DEFINITIONS = [
       "Run a long-running command in the background. Returns job_id immediately. Stdout/stderr are buffered up to 256KB. Use ssh_read_background to read, ssh_kill_background to stop.",
     inputSchema: {
       type: "object",
-      properties: { command: { type: "string" } },
+      properties: { profile: PROFILE_PROPERTY, command: { type: "string" } },
       required: ["command"],
     },
   },
@@ -206,7 +219,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: "ssh_list_background",
     description: "List all background jobs (id, status, elapsed, command).",
-    inputSchema: { type: "object", properties: {} },
+    inputSchema: { type: "object", properties: { profile: { type: "string", description: "Only the jobs of this connection" } } },
   },
 
   {
@@ -214,7 +227,7 @@ export const TOOL_DEFINITIONS = [
     description: "Write content to a file on the server (overwrites if exists).",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: PROFILE_PROPERTY,
         remote_path: { type: "string" },
         content: { type: "string" },
       },
@@ -226,7 +239,7 @@ export const TOOL_DEFINITIONS = [
     description: "Read file contents from the server.",
     inputSchema: {
       type: "object",
-      properties: { remote_path: { type: "string" } },
+      properties: { profile: PROFILE_PROPERTY, remote_path: { type: "string" } },
       required: ["remote_path"],
     },
   },
@@ -235,16 +248,17 @@ export const TOOL_DEFINITIONS = [
     description: "List directory contents on the server.",
     inputSchema: {
       type: "object",
-      properties: { remote_path: { type: "string" } },
+      properties: { profile: PROFILE_PROPERTY, remote_path: { type: "string" } },
       required: ["remote_path"],
     },
   },
   {
     name: "ssh_download_file",
-    description: "Download a file. Binary files → base64. Saved to the temp store; an ID is returned for editing.",
+    description:
+      "Download a file into the temp store; an ID is returned for ssh_temp_*. Text files: a preview inline. as_base64: true returns the whole file inline as base64 when it is at most 2 MiB (larger: temp store only, the result says so). Binary files without as_base64 are not shown inline.",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: PROFILE_PROPERTY,
         remote_path: { type: "string" },
         as_base64: { type: "boolean" },
       },
@@ -276,10 +290,10 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "ssh_temp_upload",
-    description: "Upload a temp file to the server.",
+    description: "Upload a temp file to the server. Without profile it goes back to the connection it was downloaded from; pass profile to upload it to another one.",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: PROFILE_PROPERTY,
         temp_id: { type: "string" },
         remote_path: { type: "string" },
       },
@@ -310,7 +324,7 @@ export const TOOL_DEFINITIONS = [
     description: "Stat a file/directory.",
     inputSchema: {
       type: "object",
-      properties: { remote_path: { type: "string" } },
+      properties: { profile: PROFILE_PROPERTY, remote_path: { type: "string" } },
       required: ["remote_path"],
     },
   },
@@ -319,7 +333,7 @@ export const TOOL_DEFINITIONS = [
     description: "Create a directory.",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: PROFILE_PROPERTY,
         remote_path: { type: "string" },
         recursive: { type: "boolean" },
       },
@@ -331,7 +345,7 @@ export const TOOL_DEFINITIONS = [
     description: "Rename or move.",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: PROFILE_PROPERTY,
         old_path: { type: "string" },
         new_path: { type: "string" },
       },
@@ -343,7 +357,7 @@ export const TOOL_DEFINITIONS = [
     description: "Copy on the server (cp -r).",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: PROFILE_PROPERTY,
         src_path: { type: "string" },
         dest_path: { type: "string" },
       },
@@ -355,7 +369,7 @@ export const TOOL_DEFINITIONS = [
     description: "chmod (octal: 755, 644, ...).",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: PROFILE_PROPERTY,
         remote_path: { type: "string" },
         mode: { type: "string" },
       },
@@ -367,7 +381,7 @@ export const TOOL_DEFINITIONS = [
     description: "Delete a file or empty directory (requires confirmation).",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: PROFILE_PROPERTY,
         remote_path: { type: "string" },
         is_directory: { type: "boolean" },
       },
@@ -376,10 +390,10 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "ssh_delete_confirm",
-    description: "Confirm or cancel deletion via confirmation_id.",
+    description: "Confirm or cancel deletion via confirmation_id. It runs on the connection it was issued on, whatever else is open.",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: CONFIRM_PROFILE_PROPERTY,
         confirmation_id: { type: "string" },
         confirm: { type: "boolean" },
       },
@@ -389,20 +403,25 @@ export const TOOL_DEFINITIONS = [
 
   {
     name: "ssh_get_logs",
-    description: "Current session logs.",
-    inputSchema: { type: "object", properties: { limit: { type: "number" } } },
+    description: "Session logs of every connection, each entry tagged with its connection name; profile filters to one.",
+    inputSchema: { type: "object", properties: { profile: PROFILE_PROPERTY, limit: { type: "number" } } },
   },
   {
     name: "ssh_status",
-    description: "Connection status (including proxy used).",
-    inputSchema: { type: "object", properties: {} },
+    description: "Status of every open connection (host, user, proxy used, host key); profile shows one.",
+    inputSchema: { type: "object", properties: { profile: PROFILE_PROPERTY } },
   },
   {
     name: "ssh_disconnect",
-    description: "Disconnect from the server.",
+    description:
+      "Close a connection: the one named by profile, the only open one, or every one with all: true. Refused while several are open and neither is given. cleanup_temp also removes the temp files downloaded through the closed connection(s).",
     inputSchema: {
       type: "object",
-      properties: { cleanup_temp: { type: "boolean" } },
+      properties: {
+        profile: { type: "string", description: "Connection to close (profile or connection name)" },
+        all: { type: "boolean", description: "Close every connection of this session" },
+        cleanup_temp: { type: "boolean" },
+      },
     },
   },
   {
@@ -416,7 +435,7 @@ export const TOOL_DEFINITIONS = [
       "Upload a file/directory. Files → SFTP. Directories → tar.gz, upload, extract on the server.",
     inputSchema: {
       type: "object",
-      properties: {
+      properties: { profile: PROFILE_PROPERTY,
         local_path: { type: "string" },
         remote_path: { type: "string" },
         exclude: { type: "array", items: { type: "string" } },
@@ -424,11 +443,22 @@ export const TOOL_DEFINITIONS = [
       required: ["local_path", "remote_path"],
     },
   },
+  {
+    name: "ssh_pin_host_keys",
+    description:
+      "Pin host keys without sending credentials: dials each profile (through its proxy), records the key the server presents in key exchange and aborts before authentication. Default: every profile without a pin. Never overwrites an existing pin; a different key is reported as a mismatch (then stop and tell the user). Have the user check new pins on the servers themselves.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        profiles: { type: "array", items: { type: "string" }, description: "Profile names; default: all unpinned profiles" },
+      },
+    },
+  },
 ];
 
 /* Remote mode: the MCP host is a shared server, not the agent's machine. Its filesystem is off limits, and
  * raw credentials typed by the model are refused so every connection goes through a saved (pinned) profile. */
-const REMOTE_DISABLED_TOOLS = new Set(["ssh_upload", "ssh_temp_path", "ssh_connect"]);
+const REMOTE_DISABLED_TOOLS = new Set(["ssh_upload", "ssh_temp_path", "ssh_connect", "ssh_pin_host_keys"]);
 
 /* Profiles in the vault carry the key inline; a key path would point into the server's own filesystem. Host-key
  * pins are re-set only by the owner out of band (vault pin-host-key), never by the model. */
@@ -452,11 +482,19 @@ type ToolDefinition = (typeof TOOL_DEFINITIONS)[number];
 
 export function isToolAvailable(mode: "stdio" | "remote", name: string, scoped = false): boolean {
   if (scoped && SCOPED_DISABLED_TOOLS.has(name)) return false;
-  return mode !== "remote" || !REMOTE_DISABLED_TOOLS.has(name);
+  return mode === "remote" ? !REMOTE_DISABLED_TOOLS.has(name) : true;
 }
 
+const REMOTE_CONNECT_PROFILE_NOTE =
+  " Remote mode does not trust on first use: a profile without a pinned host key is refused (unless the server runs with --allow-tofu); then stop and tell the user, the owner pins it out of band.";
+
 function toRemote(def: ToolDefinition): ToolDefinition {
-  const description = def.description.replace(/servers\.json/g, "the vault");
+  let description = def.description.replace(/servers\.json/g, "the vault");
+  if (def.name === "ssh_connect_profile") {
+    description =
+      description.replace(" The server's host key is pinned on the first connect (trust on first use);", " The profile's pinned host key is enforced;") +
+      REMOTE_CONNECT_PROFILE_NOTE;
+  }
   if (def.name !== "ssh_server_add" && def.name !== "ssh_server_update") return { ...def, description };
   const { privateKeyPath: _dropped, reset_host_key: _owner, ...properties } = (def.inputSchema as any).properties;
   return {
@@ -471,6 +509,6 @@ function toRemote(def: ToolDefinition): ToolDefinition {
 
 /** Tool definitions a client in the given mode may see and call. */
 export function listToolsFor(mode: "stdio" | "remote", scoped = false): ToolDefinition[] {
-  if (mode !== "remote") return TOOL_DEFINITIONS;
+  if (mode !== "remote") return TOOL_DEFINITIONS.filter((d) => isToolAvailable(mode, d.name));
   return TOOL_DEFINITIONS.filter((d) => isToolAvailable(mode, d.name, scoped)).map(toRemote);
 }

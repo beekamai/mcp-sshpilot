@@ -15,6 +15,17 @@ export const REMOTE_INLINE_MAX_BYTES = 2 * 1024 * 1024;
 /** Per-session cap of temp entries in remote mode: empty files cost no quota bytes but still an entry and an inode. */
 export const REMOTE_MAX_TEMP_FILES = 256;
 
+/** All remote sessions of the process together: 16 sessions x 64 MiB would pass the service memory limit when the
+ * temp dir is a tmpfs (whose pages count against the service). */
+export const REMOTE_TEMP_TOTAL_BYTES = 256 * 1024 * 1024;
+
+/* Bytes held by the temp files of every remote session, kept in step by the functions below (the only writers). */
+let remoteTempBytes = 0;
+
+function account(ctx: SessionCtx, delta: number): void {
+  if (ctx.mode === "remote") remoteTempBytes = Math.max(0, remoteTempBytes + delta);
+}
+
 function usedBytes(ctx: SessionCtx, exceptId?: string): number {
   let total = 0;
   for (const tf of ctx.tempFiles.values()) if (tf.id !== exceptId) total += tf.size;
@@ -24,12 +35,17 @@ function usedBytes(ctx: SessionCtx, exceptId?: string): number {
 /** Bytes the temp store may still take in this session, downloads in progress included (Infinity in stdio mode). */
 export function tempQuotaLeft(ctx: SessionCtx, replacingId?: string): number {
   if (ctx.mode !== "remote") return Infinity;
-  return Math.max(0, REMOTE_TEMP_QUOTA_BYTES - usedBytes(ctx, replacingId) - ctx.inflight.temp);
+  const replaced = replacingId ? ctx.tempFiles.get(replacingId)?.size ?? 0 : 0;
+  const session = REMOTE_TEMP_QUOTA_BYTES - usedBytes(ctx, replacingId) - ctx.inflight.temp;
+  const total = REMOTE_TEMP_TOTAL_BYTES - (remoteTempBytes - replaced) - ctx.inflight.temp;
+  return Math.max(0, Math.min(session, total));
 }
 
 function assertFits(ctx: SessionCtx, size: number, replacingId?: string): void {
   if (size > tempQuotaLeft(ctx, replacingId)) {
-    throw new Error(`Temp store limit reached (${REMOTE_TEMP_QUOTA_BYTES / 1024 / 1024} MiB per session); free space with ssh_temp_delete or ssh_temp_cleanup`);
+    throw new Error(
+      `Temp store limit reached (${REMOTE_TEMP_QUOTA_BYTES / 1024 / 1024} MiB per session, ${REMOTE_TEMP_TOTAL_BYTES / 1024 / 1024} MiB for all sessions); free space with ssh_temp_delete or ssh_temp_cleanup`
+    );
   }
 }
 
@@ -86,6 +102,7 @@ export function addTempFile(ctx: SessionCtx, slot: TempSlot, remotePath: string,
     downloadedAt: new Date(),
   };
   ctx.tempFiles.set(slot.id, tempFile);
+  account(ctx, size);
   return tempFile;
 }
 
@@ -115,6 +132,7 @@ export function updateTempFile(ctx: SessionCtx, id: string, content: Buffer): bo
   if (!tf) return false;
   assertFits(ctx, content.length, id);
   writeFileSync(tf.localPath, content);
+  account(ctx, content.length - tf.size);
   tf.size = content.length;
   return true;
 }
@@ -125,6 +143,7 @@ export function deleteTempFile(ctx: SessionCtx, id: string): boolean {
   try {
     if (existsSync(tf.localPath)) unlinkSync(tf.localPath);
     ctx.tempFiles.delete(id);
+    account(ctx, -tf.size);
     return true;
   } catch {
     return false;
@@ -137,9 +156,11 @@ export function cleanupAllTempFiles(ctx: SessionCtx): number {
     try {
       if (existsSync(tf.localPath)) unlinkSync(tf.localPath);
       ctx.tempFiles.delete(id);
+      account(ctx, -tf.size);
       count++;
     } catch {
-      /* ignore */
+      /* A closing session drops the entry anyway (its directory is removed next), so release its bytes too. */
+      if (ctx.destroyed) account(ctx, -tf.size);
     }
   }
   return count;

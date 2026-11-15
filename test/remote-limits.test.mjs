@@ -24,7 +24,7 @@ before(async () => {
     port: 0,
     handleSignals: false,
     log: () => {},
-    limits: { maxBodyBytes: MiB, maxBodyBytesTotal: 1.5 * MiB },
+    limits: { maxBodyBytes: MiB, maxBodyBytesTotal: 1.5 * MiB, maxRequestsPerPrincipal: 8 },
   });
 });
 
@@ -85,6 +85,29 @@ test("declared but unsent bodies hold no budget, so they cannot lock out the own
   /* 400: the padding is not JSON. Anything but 503 shows the body was read in full. */
   assert.equal(await ok.status, 400);
   idle.forEach((p) => p.req.destroy());
+});
+
+test("a JSON-RPC batch with more than one request is refused", async () => {
+  const init = { jsonrpc: "2.0", method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } } };
+  const res = await fetch(`http://127.0.0.1:${srv.port}/mcp`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify([{ ...init, id: 1 }, { jsonrpc: "2.0", id: 2, method: "tools/list" }]),
+  });
+  assert.equal(res.status, 400);
+  assert.match(await res.text(), /batches are not supported/);
+});
+
+test("one device cannot hold more requests than its share", async () => {
+  const held = Array.from({ length: 8 }, () => slowPost(1024, 10));
+  await wait(200);
+  const extra = slowPost(16, 16);
+  assert.equal(await extra.status, 429);
+  held.forEach((p) => p.req.destroy());
+  await wait(200);
+  const after = slowPost(64, 10);
+  assert.equal(await stillReading(after), "reading", "slots are released when requests close");
+  after.req.destroy();
 });
 
 test("remote exec timeout is capped at one hour", () => {

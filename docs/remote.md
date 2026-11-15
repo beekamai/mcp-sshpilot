@@ -393,7 +393,10 @@ overrides and pending confirmations are per session.
 |---|---|
 | Request body | 8 MiB (413); 64 MiB of bodies being read at once across all sessions, past that 503 with `Retry-After: 1` |
 | Command timeout | `timeout_ms` up to 1 hour (a running call keeps its session from the idle sweep and from eviction) |
-| Unread responses | A response whose client stops reading for 60 s is dropped with its connection |
+| Unread responses | A response whose client stops reading for 60 s is dropped with its connection; a closed session drops its open responses |
+| Requests in flight | 64 per device or grant (open GET streams included), 128 for all connector grants together (429) |
+| Batches | One JSON-RPC request per POST (batches were removed from the MCP spec in 2025-06-18); a batch with more gets 400 |
+| Temp store | 64 MiB per session and 256 MiB for all sessions together |
 | Sessions | 4 per device or grant (its least recently used idle session is evicted), 8 for all connector grants together, 16 total (429) |
 | Idle session | Closed after 30 min without requests and with no tool call running; an open GET event stream (or a POST stream that will never be answered) does not count. The client re-initializes. |
 | Concurrent tool calls | 32 running calls per session; a cancelled call counts until its handler really ends. A POST that would exceed it gets 429; a request id that is still in flight in the session gets 400 |
