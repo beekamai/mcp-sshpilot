@@ -18,7 +18,10 @@ export interface ServerProfile {
   username: string;
   password?: string;
   privateKeyPath?: string;
+  privateKey?: string;
   passphrase?: string;
+  /** Pinned host key, "SHA256:<base64>" as OpenSSH prints it. */
+  hostKeySha256?: string;
   description?: string;
   /* Per-server proxy. null = force direct connection, overriding the global proxy. */
   proxy?: ProxyConfig | null;
@@ -48,6 +51,10 @@ export interface SSHSession {
   target: string;
   /* One SFTP channel per session: opening one per call exhausts sshd MaxSessions (default 10). */
   sftp?: Promise<SFTPWrapper>;
+  /** Host key seen in this handshake, "SHA256:<base64>". */
+  hostKeySha256?: string;
+  /** True when the key was checked against a profile's pin or was pinned into the profile by this connect. */
+  hostKeyPinned?: boolean;
 }
 
 /** Parameters of the last successful connect, replayed by ensureConnected() after the session drops. */
@@ -55,6 +62,9 @@ export interface LastConnect {
   config: ConnectConfig;
   proxy?: ProxyConfig;
   label: string;
+  hostKeySha256?: string;
+  /** True when that key was checked against, or saved as, a profile's pin (ssh_status reports it). */
+  hostKeyPinned?: boolean;
 }
 
 export interface PendingConfirmation {

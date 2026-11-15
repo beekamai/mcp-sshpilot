@@ -78,6 +78,8 @@ npm i -g mcp-sshpilot@latest
 - ⏳ **Background jobs** — for long-running / daemon-like commands
 - ⚙️ **Profile CRUD by the agent** — `ssh_server_add` / `update` / `remove`
 - 📜 **Full session log** + `ssh://logs` resource
+- 🔏 **Host key pinning** — the first connect pins the server's key (TOFU); a different key is refused before any credential is sent
+- 🌍 **Remote mode** — one HTTPS server with an encrypted profile vault for agents on several devices ([Remote mode](#remote-mode))
 
 ### Install (alternatives)
 
@@ -212,7 +214,7 @@ The AI **never sees proxy passwords** in `ssh_proxy_status` — only `type://use
 | Tool | Description |
 |---|---|
 | `ssh_server_add` | Add a profile to `servers.json` |
-| `ssh_server_update` | Update fields (with `rename_to`). `proxy:null` forces direct, `proxy:false` removes the field |
+| `ssh_server_update` | Update fields (with `rename_to`). `proxy:null` forces direct, `proxy:false` removes the field. `reset_host_key:true` drops the pinned host key (stdio only; remote: `vault pin-host-key`) |
 | `ssh_server_remove` | Remove a profile by name |
 
 #### Proxy management
@@ -257,6 +259,34 @@ The AI **never sees proxy passwords** in `ssh_proxy_status` — only `type://use
 
 The MCP resource `ssh://logs` is also exposed.
 
+### Remote mode
+
+Run one server on a box you control and let several agents on different devices share the same profiles over HTTPS:
+
+```bash
+export MCP_SSHPILOT_VAULT=./vault.json
+mcp-sshpilot vault init --import ~/.config/mcp-sshpilot/servers.json --out recovery.token   # keep it offline
+mcp-sshpilot vault add-device laptop --out laptop.token   # unlock key from $MCP_SSHPILOT_UNLOCK_KEY or stdin
+mcp-sshpilot serve                                        # 127.0.0.1:8722, put TLS in front (deploy/ has Docker + Caddy)
+
+claude mcp add --transport http --scope user sshpilot https://mcp.example.com/mcp \
+  --header "Authorization: Bearer <device token>"
+```
+
+- Profiles live in an AES-256-GCM vault; the server stores no key that opens it. A device token unlocks it for that device's session only.
+- One token per device, revocable at once (`vault revoke-device`); sessions are isolated per device.
+- Plain HTTP off loopback is refused unless forced; browser origins are blocked by default; failed auth is rate limited.
+- Tools that touch the server's own filesystem (`ssh_upload`, `ssh_temp_path`) and raw `ssh_connect` are disabled remotely.
+- Host keys are re-pinned only by the owner (`vault pin-host-key`), never by the model; `vault rotate` also replaces the recovery key.
+
+**Claude connectors (web/mobile):** with `serve --oauth --public-url https://mcp.example.com` the server also speaks
+the MCP OAuth flow. When you add it as a custom connector, a consent page on your own server asks for a device token
+and lets you tick exactly which profiles that connector may use; it gets its own encrypted copy of those profiles
+only, can't change them, and is revoked with `vault revoke-grant` (or together with the device that approved it,
+`vault revoke-device`). Approve only a connection you started yourself a moment ago.
+
+Setup, threat model, revocation limits and the Docker deployment: **[docs/remote.md](./docs/remote.md)**.
+
 ### Security & secret hygiene
 
 - `servers.json` is in `.gitignore` — **don't commit credentials**.
@@ -297,18 +327,27 @@ Removal (`rm -rf`, `rmdir`), formatting (`mkfs`, `dd if=`, `fdisk`, `parted`), s
 
 ```
 src/
-  index.ts       — entrypoint (Server, transport, ssh://logs resource)
+  index.ts       — entrypoint: CLI dispatch, stdio server
+  cli.ts         — `vault ...` and `serve` commands
+  mcp-server.ts  — builds one MCP Server per session ctx (tools, ssh://logs)
+  http.ts        — remote mode: Streamable HTTP, auth, sessions, limits, audit
+  oauth.ts       — OAuth for Claude connectors: discovery, registration, consent, tokens
+  consent.ts     — HTML of the consent pages
+  vault.ts       — encrypted profile vault, device tokens, connector grants
   types.ts       — shared types
-  state.ts       — global state (session, pending, jobs, override)
+  state.ts       — per-session state (SessionCtx) and its teardown
   utils.ts       — id, byte/perm/log formatters
   danger.ts      — patterns + checkDangerousCommand
-  config.ts      — servers.json: load/save/CRUD/profileToConnectConfig
+  config.ts      — ProfileStore, servers.json store, profileToConnectConfig
   proxy.ts       — validate/describe/resolve + buildProxySocket + HTTP CONNECT
-  ssh-core.ts    — connect/disconnect/execute + background jobs
+  ssh-core.ts    — connect/disconnect/execute, host key pinning, background jobs
   ssh-fs.ts      — SFTP ops + bulk upload (tar.gz)
-  temp.ts        — temp file store
-  tools.ts       — MCP tool definitions
+  temp.ts        — temp file store (per-session quota in remote mode)
+  tools.ts       — MCP tool definitions, remote-mode filtering
   handlers.ts    — tool call dispatcher
+test/            — node:test suites (npm test)
+deploy/          — Dockerfile, docker-compose.yml, Caddyfile
+docs/remote.md   — remote mode guide and threat model
 ```
 
 </details>
@@ -388,6 +427,8 @@ npm i -g mcp-sshpilot@latest
 - ⏳ **Background jobs** — для долгих/демонских команд
 - ⚙️ **CRUD профилей агентом** — `ssh_server_add` / `update` / `remove`
 - 📜 **Полный лог сессии** + ресурс `ssh://logs`
+- 🔏 **Пиннинг ключа хоста** — первый коннект запоминает ключ сервера (TOFU); другой ключ отклоняется до отправки любых кредов
+- 🌍 **Remote mode** — один HTTPS-сервер с зашифрованным хранилищем профилей для агентов на нескольких устройствах ([Remote mode](#remote-mode-1))
 
 ### Установка (альтернативы)
 
@@ -522,7 +563,7 @@ AI **не видит пароли проксей** при `ssh_proxy_status` —
 | Tool | Описание |
 |---|---|
 | `ssh_server_add` | Добавить профиль в `servers.json` |
-| `ssh_server_update` | Обновить поля (с `rename_to`). `proxy:null` — direct, `proxy:false` — снести поле |
+| `ssh_server_update` | Обновить поля (с `rename_to`). `proxy:null` — direct, `proxy:false` — снести поле. `reset_host_key:true` — сбросить запиненный ключ хоста (только stdio; в remote — `vault pin-host-key`) |
 | `ssh_server_remove` | Удалить профиль по имени |
 
 #### Управление proxy
@@ -567,6 +608,34 @@ AI **не видит пароли проксей** при `ssh_proxy_status` —
 
 Также есть MCP-ресурс `ssh://logs`.
 
+### Remote mode
+
+Один сервер на твоей машине, и несколько агентов на разных устройствах работают с одними и теми же профилями по HTTPS:
+
+```bash
+export MCP_SSHPILOT_VAULT=./vault.json
+mcp-sshpilot vault init --import ~/.config/mcp-sshpilot/servers.json --out recovery.token   # хранить офлайн
+mcp-sshpilot vault add-device laptop --out laptop.token   # ключ разблокировки из $MCP_SSHPILOT_UNLOCK_KEY или stdin
+mcp-sshpilot serve                                        # 127.0.0.1:8722, TLS спереди (в deploy/ — Docker + Caddy)
+
+claude mcp add --transport http --scope user sshpilot https://mcp.example.com/mcp \
+  --header "Authorization: Bearer <токен устройства>"
+```
+
+- Профили лежат в хранилище AES-256-GCM; сервер не хранит ключа, который его открывает. Токен устройства открывает его только на время сессии этого устройства.
+- Свой токен на каждое устройство, отзывается сразу (`vault revoke-device`); сессии изолированы по устройствам.
+- Plain HTTP не на loopback запрещён без явного флага; браузерные origin по умолчанию заблокированы; неудачная авторизация ограничена по частоте.
+- Тулы, трогающие файловую систему самого сервера (`ssh_upload`, `ssh_temp_path`), и сырой `ssh_connect` в remote-режиме отключены.
+- Ключи хостов перепиниваются только владельцем (`vault pin-host-key`), не моделью; `vault rotate` заодно меняет recovery key.
+
+**Коннекторы Claude (веб/мобайл):** с `serve --oauth --public-url https://mcp.example.com` сервер ещё и говорит
+по MCP OAuth. При добавлении его как custom connector страница согласия на твоём же сервере спрашивает device-токен
+и даёт отметить, какие именно профили доступны этому коннектору; он получает собственную зашифрованную копию только
+этих профилей, менять их не может, а отзывается через `vault revoke-grant` (или вместе с устройством, которое его
+одобрило, `vault revoke-device`). Одобряй только подключение, которое сам только что начал.
+
+Установка, модель угроз, пределы отзыва и деплой в Docker: **[docs/remote.md](./docs/remote.md)** (на английском).
+
 ### Безопасность и работа с секретами
 
 - `servers.json` в `.gitignore` — **не коммить пароли**.
@@ -607,18 +676,27 @@ Belt-and-suspenders: храни `servers.json` вне workspace (вариант 
 
 ```
 src/
-  index.ts       — entrypoint (Server, transport, ресурс ssh://logs)
+  index.ts       — entrypoint: разбор CLI, stdio-сервер
+  cli.ts         — команды `vault ...` и `serve`
+  mcp-server.ts  — MCP Server на каждый session ctx (тулы, ssh://logs)
+  http.ts        — remote mode: Streamable HTTP, авторизация, сессии, лимиты, аудит
+  oauth.ts       — OAuth для коннекторов Claude: discovery, регистрация, согласие, токены
+  consent.ts     — HTML страниц согласия
+  vault.ts       — зашифрованное хранилище профилей, токены устройств, гранты коннекторов
   types.ts       — общие типы
-  state.ts       — глобальное состояние (сессия, pending, jobs, override)
+  state.ts       — состояние сессии (SessionCtx) и его очистка
   utils.ts       — id, форматирование байт/прав/логов
   danger.ts      — паттерны и checkDangerousCommand
-  config.ts      — servers.json: load/save/CRUD/profileToConnectConfig
+  config.ts      — ProfileStore, хранилище servers.json, profileToConnectConfig
   proxy.ts       — validate/describe/resolve + buildProxySocket + HTTP CONNECT
-  ssh-core.ts    — connect/disconnect/execute + background jobs
+  ssh-core.ts    — connect/disconnect/execute, пиннинг ключа хоста, background jobs
   ssh-fs.ts      — SFTP операции + bulk upload (tar.gz)
-  temp.ts        — temp file store
-  tools.ts       — MCP tool definitions
+  temp.ts        — temp file store (квота на сессию в remote mode)
+  tools.ts       — MCP tool definitions, фильтр для remote mode
   handlers.ts    — диспатч tool calls
+test/            — тесты node:test (npm test)
+deploy/          — Dockerfile, docker-compose.yml, Caddyfile
+docs/remote.md   — гайд по remote mode и модель угроз
 ```
 
 </details>

@@ -2,7 +2,12 @@ import { Socket } from "net";
 import { connect as tlsConnect } from "tls";
 import { SocksClient } from "socks";
 import type { ProxyConfig, ServerProfile, ServersConfig } from "./types.js";
-import { getProxyOverride } from "./state.js";
+import type { SessionCtx } from "./state.js";
+import { plainText } from "./utils.js";
+
+const CONNECT_TIMEOUT_MS = 30_000;
+/* Far above any real CONNECT answer; a proxy streaming without an end of header must not grow memory unbounded. */
+const CONNECT_MAX_HEADER_BYTES = 16 * 1024;
 
 export function describeProxy(p?: ProxyConfig | null): string | undefined {
   if (!p) return undefined;
@@ -28,10 +33,11 @@ export function validateProxy(p: any): ProxyConfig {
 }
 
 export function resolveProxyForProfile(
+  ctx: SessionCtx,
   profile: ServerProfile,
   cfg: ServersConfig
 ): ProxyConfig | undefined {
-  const override = getProxyOverride();
+  const override = ctx.proxyOverride;
   if (override.mode === "disabled") return undefined;
   if (override.mode === "force") return override.proxy;
   if (profile.proxy === null) return undefined;
@@ -39,15 +45,17 @@ export function resolveProxyForProfile(
   return cfg.proxy;
 }
 
+/** connectAddress: where to dial the proxy (an already checked IP); TLS still verifies the proxy by its name. */
 export async function buildProxySocket(
   proxy: ProxyConfig,
   destHost: string,
-  destPort: number
+  destPort: number,
+  connectAddress: string = proxy.host
 ): Promise<Socket> {
   if (proxy.type === "socks4" || proxy.type === "socks5") {
     const { socket } = await SocksClient.createConnection({
       proxy: {
-        host: proxy.host,
+        host: connectAddress,
         port: proxy.port,
         type: proxy.type === "socks4" ? 4 : 5,
         userId: proxy.username,
@@ -59,36 +67,39 @@ export async function buildProxySocket(
     });
     return socket;
   }
-  return httpConnectTunnel(proxy, destHost, destPort);
+  return httpConnectTunnel(proxy, destHost, destPort, connectAddress);
 }
 
 function httpConnectTunnel(
   proxy: ProxyConfig,
   destHost: string,
-  destPort: number
+  destPort: number,
+  connectAddress: string
 ): Promise<Socket> {
   return new Promise((resolve, reject) => {
     const sock: Socket =
       proxy.type === "https"
-        ? (tlsConnect({ host: proxy.host, port: proxy.port, servername: proxy.host }) as unknown as Socket)
+        ? (tlsConnect({ host: connectAddress, port: proxy.port, servername: proxy.host }) as unknown as Socket)
         : new Socket();
 
-    const cleanup = () => {
-      sock.removeListener("error", onError);
-      sock.removeListener("timeout", onTimeout);
+    /* Stays for the socket's life: an 'error' with no listener (a proxy resetting after the handshake failed, or before
+     * ssh2 attached its own) would end the whole process. ssh2 still gets every error through its own listener. */
+    sock.on("error", () => {});
+    let done = false;
+    const fail = (msg: string) => {
+      if (done) return;
+      done = true;
+      clearTimeout(deadline);
+      sock.removeListener("data", onData);
+      sock.destroy();
+      reject(new Error(msg));
     };
-    const onError = (e: Error) => {
-      cleanup();
-      reject(new Error(`HTTP CONNECT proxy error: ${e.message}`));
-    };
-    const onTimeout = () => {
-      cleanup();
-      reject(new Error("HTTP CONNECT proxy timeout"));
-    };
-
-    sock.setTimeout(30_000);
+    /* One deadline for the whole handshake: an idle timeout lets a proxy trickle a byte every 29 s forever. */
+    const deadline = setTimeout(() => fail("HTTP CONNECT proxy timeout"), CONNECT_TIMEOUT_MS);
+    const onError = (e: Error) => fail(`HTTP CONNECT proxy error: ${e.message}`);
+    const onClose = () => fail("HTTP CONNECT proxy closed the connection");
     sock.once("error", onError);
-    sock.once("timeout", onTimeout);
+    sock.once("close", onClose);
 
     const sendRequest = () => {
       const auth = proxy.username
@@ -104,30 +115,38 @@ function httpConnectTunnel(
       sock.write(req);
     };
 
-    let buf = "";
+    let buf = Buffer.alloc(0);
     const onData = (chunk: Buffer) => {
-      buf += chunk.toString("utf8");
-      if (buf.includes("\r\n\r\n")) {
-        sock.removeListener("data", onData);
-        const statusLine = buf.split("\r\n", 1)[0];
-        const m = /^HTTP\/1\.[01]\s+(\d{3})/.exec(statusLine);
-        if (!m || m[1] !== "200") {
-          cleanup();
-          sock.destroy();
-          reject(new Error(`HTTP CONNECT failed: ${statusLine}`));
-          return;
-        }
-        sock.setTimeout(0);
-        cleanup();
-        resolve(sock);
+      buf = Buffer.concat([buf, chunk]);
+      const end = buf.indexOf("\r\n\r\n");
+      if (end < 0) {
+        if (buf.length > CONNECT_MAX_HEADER_BYTES) fail("HTTP CONNECT proxy sent an oversized response header");
+        return;
       }
+      const lineEnd = buf.indexOf("\r\n");
+      const statusLine = plainText(buf.subarray(0, lineEnd).toString("utf8"), 200);
+      const m = /^HTTP\/1\.[01]\s+(\d{3})/.exec(statusLine);
+      if (!m || m[1] !== "200") {
+        fail(`HTTP CONNECT failed: ${statusLine}`);
+        return;
+      }
+      done = true;
+      clearTimeout(deadline);
+      sock.removeListener("data", onData);
+      sock.removeListener("error", onError);
+      sock.removeListener("close", onClose);
+      /* Bytes past the header already belong to the tunnel (the SSH banner can share the packet). ssh2 pauses,
+       * attaches its reader and resumes, so paused + unshifted bytes reach it first. */
+      sock.pause();
+      if (end + 4 < buf.length) sock.unshift(buf.subarray(end + 4));
+      resolve(sock);
     };
     sock.on("data", onData);
 
     if (proxy.type === "https") {
       sock.once("secureConnect" as any, sendRequest);
     } else {
-      sock.connect(proxy.port, proxy.host, sendRequest);
+      sock.connect(proxy.port, connectAddress, sendRequest);
     }
   });
 }

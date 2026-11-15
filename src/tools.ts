@@ -31,7 +31,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: "ssh_connect_profile",
     description:
-      "Connect using a saved profile from servers.json. The AI does NOT see credentials — only the profile name. Proxy precedence: runtime override → server.proxy → config.proxy. server.proxy=null forces direct connection for this server.",
+      "Connect using a saved profile from servers.json. The AI does NOT see credentials — only the profile name. Proxy precedence: runtime override → server.proxy → config.proxy. server.proxy=null forces direct connection for this server. The server's host key is pinned on the first connect (trust on first use); a different key is refused. On a mismatch, stop and tell the user: never re-pin a key you cannot verify yourself.",
     inputSchema: {
       type: "object",
       properties: { profile_name: { type: "string" } },
@@ -77,7 +77,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: "ssh_server_update",
     description:
-      "Update an existing profile. Only fields you pass are changed. proxy:null → force direct; proxy:false → drop the field entirely; proxy:object → set it.",
+      "Update an existing profile. Only fields you pass are changed. proxy:null → force direct; proxy:false → drop the field entirely; proxy:object → set it. Changing host/port/username/proxy keeps the pinned host key, so the new route must lead to a server with the same key; a live session keeps verifying against the key it connected with.",
     inputSchema: {
       type: "object",
       properties: {
@@ -91,6 +91,11 @@ export const TOOL_DEFINITIONS = [
         description: { type: "string" },
         rename_to: { type: "string", description: "New profile name" },
         proxy: { description: "object | null | false" },
+        reset_host_key: {
+          type: "boolean",
+          description:
+            "Drop the pinned host key; the next ssh_connect_profile pins the key the server presents. Only after the user verified the new key on the server itself.",
+        },
       },
       required: ["name"],
     },
@@ -420,3 +425,52 @@ export const TOOL_DEFINITIONS = [
     },
   },
 ];
+
+/* Remote mode: the MCP host is a shared server, not the agent's machine. Its filesystem is off limits, and
+ * raw credentials typed by the model are refused so every connection goes through a saved (pinned) profile. */
+const REMOTE_DISABLED_TOOLS = new Set(["ssh_upload", "ssh_temp_path", "ssh_connect"]);
+
+/* Profiles in the vault carry the key inline; a key path would point into the server's own filesystem. Host-key
+ * pins are re-set only by the owner out of band (vault pin-host-key), never by the model. */
+const REMOTE_KEY_PROPERTY = {
+  type: "string",
+  description: "Private key contents (PEM/OpenSSH). Stored encrypted in the vault; never returned by any tool.",
+};
+
+/* Connector grants are read-only snapshots: the only store write they keep is a first-use host-key pin, and the
+ * proxy tools would let the model reroute (or unpin-gate) a granted profile. */
+const SCOPED_DISABLED_TOOLS = new Set([
+  "ssh_server_add",
+  "ssh_server_update",
+  "ssh_server_remove",
+  "ssh_proxy_set",
+  "ssh_proxy_enable",
+  "ssh_proxy_disable",
+]);
+
+type ToolDefinition = (typeof TOOL_DEFINITIONS)[number];
+
+export function isToolAvailable(mode: "stdio" | "remote", name: string, scoped = false): boolean {
+  if (scoped && SCOPED_DISABLED_TOOLS.has(name)) return false;
+  return mode !== "remote" || !REMOTE_DISABLED_TOOLS.has(name);
+}
+
+function toRemote(def: ToolDefinition): ToolDefinition {
+  const description = def.description.replace(/servers\.json/g, "the vault");
+  if (def.name !== "ssh_server_add" && def.name !== "ssh_server_update") return { ...def, description };
+  const { privateKeyPath: _dropped, reset_host_key: _owner, ...properties } = (def.inputSchema as any).properties;
+  return {
+    ...def,
+    description:
+      def.name === "ssh_server_update"
+        ? description + " On a profile without a pinned host key, a route change removes the stored password unless a new one is passed."
+        : description,
+    inputSchema: { ...def.inputSchema, properties: { ...properties, privateKey: REMOTE_KEY_PROPERTY } },
+  } as ToolDefinition;
+}
+
+/** Tool definitions a client in the given mode may see and call. */
+export function listToolsFor(mode: "stdio" | "remote", scoped = false): ToolDefinition[] {
+  if (mode !== "remote") return TOOL_DEFINITIONS;
+  return TOOL_DEFINITIONS.filter((d) => isToolAvailable(mode, d.name, scoped)).map(toRemote);
+}

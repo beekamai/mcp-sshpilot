@@ -12,6 +12,15 @@ export function assertNotUnc(p: string, what: string): void {
   }
 }
 
+/** C0/C1 controls, DEL and the bidirectional-text controls (ALM, LRM, RLM, embeddings, overrides, isolates), which
+ * reorder how the text around them is shown. One set for every sanitizer, so they cannot drift apart. */
+export const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+/** Free text from a client or a form: no control or bidi characters, whitespace collapsed, at most max UTF-16 units. */
+export function plainText(s: string | null | undefined, max: number): string {
+  return (s ?? "").replace(CONTROL_CHARS, " ").replace(/\s+/g, " ").trim().slice(0, max).trim();
+}
+
 /** Quotes a string as one POSIX shell word. */
 export function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
