@@ -5,8 +5,8 @@ By default mcp-sshpilot is a local stdio server: one MCP client, one process, pr
 agents on different devices (laptop, desktop, a CI runner) share the same saved SSH profiles over HTTPS.
 
 ```
- agent (device A) ─┐   HTTPS + Bearer token        ┌─ Caddy (TLS, Host check) ─ sshpilot serve ─── SSH ──> your servers
- agent (device B) ─┘ ─────────────────────────────>│                            (vault.json, encrypted)
+ agent (device A) ─┐   HTTPS + Bearer token        ┌─ nginx / Caddy (TLS) ─ sshpilot serve ─── SSH ──> your servers
+ agent (device B) ─┘ ─────────────────────────────>│                        (vault.json, encrypted)
 ```
 
 - Transport: MCP Streamable HTTP, one endpoint `/mcp` (POST/GET/DELETE) and a bare `/healthz`.
@@ -18,80 +18,133 @@ Everything below is secure by default. Every relaxation needs an explicit flag.
 
 ---
 
-## Quick start: Docker + Caddy
+## Quick start: systemd + nginx
 
-Requirements: a host with Docker, a DNS name pointing at it (`mcp.example.com` below), ports 80/443 open.
+Requirements: a Linux host with Node.js 18+, nginx, a DNS name pointing at it (`mcp.example.com` below) and a TLS
+certificate for it (e.g. certbot).
 
 **1. Build the vault on a trusted machine** (where your `servers.json` and key files live). Import inlines every
 `privateKeyPath` file into the encrypted vault:
 
 ```bash
+npm i -g mcp-sshpilot
 export MCP_SSHPILOT_VAULT=./vault.json
-npx mcp-sshpilot vault init --import ~/.config/mcp-sshpilot/servers.json --out ./recovery.token
+mcp-sshpilot vault init --import ~/.config/mcp-sshpilot/servers.json --out ./recovery.token
 # Store recovery.token offline (password manager), then delete the file.
 
 # One device per agent/machine. The unlock key (recovery key or an existing device token) is read from
 # MCP_SSHPILOT_UNLOCK_KEY or stdin, never from argv.
-npx mcp-sshpilot vault add-device laptop  --out ./laptop.token
-npx mcp-sshpilot vault add-device desktop --out ./desktop.token
-npx mcp-sshpilot vault list-devices
+mcp-sshpilot vault add-device laptop  --out ./laptop.token
+mcp-sshpilot vault add-device desktop --out ./desktop.token
+mcp-sshpilot vault list-devices
 ```
 
 `vault.json` is safe to copy: without a token or the recovery key it is ciphertext. Copy it to the server **once**,
-for the first deployment. After that the server's copy is the live one (revocations, TOFU pins and profiles added
-through the server land there): change it in place with the `vault` service below, never by copying an older vault
-over it, which would silently undo all of that.
+for the first deployment. After that the server's copy is the live one (revocations, pins and profiles added
+through the server land there): change it in place on the server, never by copying an older vault over it, which
+would silently undo all of that.
 
-**2. Deploy**
+**2. Install on the server**
 
 ```bash
-git clone https://github.com/beekamai/mcp-sshpilot && cd mcp-sshpilot/deploy
-echo "SSHPILOT_DOMAIN=mcp.example.com" > .env
-mkdir -p data && cp /path/to/vault.json data/ && sudo chown -R 1000:1000 data && chmod 700 data
-docker compose up -d --build
+sudo useradd --system --home-dir /var/lib/sshpilot --shell /usr/sbin/nologin sshpilot
+sudo install -d -o sshpilot -g sshpilot -m 700 /var/lib/sshpilot
+sudo install -o sshpilot -g sshpilot -m 600 vault.json /var/lib/sshpilot/vault.json
+sudo npm i --prefix /opt/sshpilot mcp-sshpilot
+```
+
+`/etc/systemd/system/sshpilot.service`:
+
+```ini
+[Unit]
+Description=mcp-sshpilot remote MCP server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=sshpilot
+Group=sshpilot
+WorkingDirectory=/var/lib/sshpilot
+Environment=NODE_ENV=production
+Environment=MCP_SSHPILOT_VAULT=/var/lib/sshpilot/vault.json
+ExecStart=/usr/bin/node /opt/sshpilot/node_modules/mcp-sshpilot/dist/index.js serve --host 127.0.0.1 --port 8722 --trust-proxy
+Restart=always
+RestartSec=3
+UMask=0077
+MemoryMax=768M
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sshpilot
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
+```
+
+nginx, in the `server { listen 443 ssl; server_name mcp.example.com; ... }` block:
+
+```nginx
+client_max_body_size 8m;
+add_header Strict-Transport-Security "max-age=31536000" always;
+
+location / {
+  proxy_pass http://127.0.0.1:8722;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  # The TCP peer, never a client-sent header. With the realip module on, use $realip_remote_addr instead.
+  proxy_set_header X-Forwarded-For $remote_addr;
+  proxy_set_header X-Forwarded-Proto https;
+  proxy_set_header Connection "";
+  proxy_buffering off;
+  proxy_request_buffering off;
+  proxy_read_timeout 3600s;
+  proxy_send_timeout 3600s;
+}
+```
+
+Keep the access log free of `$http_authorization` and query strings of `/oauth/*`.
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now sshpilot
 curl https://mcp.example.com/healthz        # -> ok
 ```
 
-Only Caddy publishes ports. `sshpilot` listens on plain HTTP inside the compose network (that is what
-`--insecure-http` in the compose file means) and trusts Caddy's `X-Forwarded-For` (`--trust-proxy`).
-The container runs as a non-root user with a read-only root filesystem, `cap_drop: ALL` and
-`no-new-privileges`; the per-session temp stores live in a size-limited tmpfs.
-
-Vault commands can also run on the server, through the separate `vault` service (interactive, the unlock key
-prompt does not echo):
+Vault commands on the server run as the service user against the live file; the unlock key goes to stdin:
 
 ```bash
-docker compose run --rm vault add-device ci-runner
-docker compose run --rm vault revoke-device laptop
-docker compose run --rm vault pin-host-key prod SHA256:...
+V="sudo -u sshpilot env MCP_SSHPILOT_VAULT=/var/lib/sshpilot/vault.json /usr/bin/node /opt/sshpilot/node_modules/mcp-sshpilot/dist/index.js vault"
+$V list-devices
+$V revoke-device laptop
+$V pin-host-key prod SHA256:...
 ```
 
-Use the `vault` service, never `docker compose run sshpilot vault ...` or a plain `docker run`: whatever a container
-prints to stdout goes to Docker's log driver, which may keep it on the same disk as the vault (journald on
-Fedora/RHEL packages, `json-file` everywhere else until the container is removed). The `vault` service has logging
-turned off and no network. On your own machine, `--out <file>` (created 0600) keeps a secret off the terminal too.
-
-The image's default command listens on the container's loopback only, so a bare `docker run -p 8722:8722` exposes
-nothing; the plain-HTTP flags exist only in the compose file, where sshpilot is reachable from Caddy alone.
+Updating: `sudo npm i --prefix /opt/sshpilot mcp-sshpilot@latest && sudo systemctl restart sshpilot`.
 
 **3. Connect an agent.** Claude Code:
 
 ```bash
-claude mcp add --transport http --scope user sshpilot https://mcp.example.com/mcp \
-  --header "Authorization: Bearer sshp_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+claude mcp add --transport http --scope user sshpilot https://mcp.example.com/mcp   --header "Authorization: Bearer sshp_xxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
 Never put a literal token into a project-scoped `.mcp.json` that could be committed. If you need a project
 config, reference an environment variable instead: `"headers": { "Authorization": "Bearer ${SSHPILOT_TOKEN}" }`.
 Any MCP client that supports Streamable HTTP and custom headers works the same way.
 
-## Without Docker
+## Serve options
 
 ```bash
-npm i -g mcp-sshpilot
 MCP_SSHPILOT_VAULT=/srv/sshpilot/vault.json mcp-sshpilot serve                      # 127.0.0.1:8722, put a TLS proxy in front
-MCP_SSHPILOT_VAULT=/srv/sshpilot/vault.json mcp-sshpilot serve --host 0.0.0.0 \
-  --tls-cert /etc/ssl/sshpilot.crt --tls-key /etc/ssl/sshpilot.key                 # native TLS (1.2+)
+MCP_SSHPILOT_VAULT=/srv/sshpilot/vault.json mcp-sshpilot serve --host 0.0.0.0   --tls-cert /etc/ssl/sshpilot.crt --tls-key /etc/ssl/sshpilot.key                 # native TLS (1.2+)
 ```
 
 | Flag | Meaning |
@@ -99,9 +152,10 @@ MCP_SSHPILOT_VAULT=/srv/sshpilot/vault.json mcp-sshpilot serve --host 0.0.0.0 \
 | `--host` / `--port` | Bind address, default `127.0.0.1:8722`. |
 | `--tls-cert` / `--tls-key` | Serve HTTPS directly. Both or neither. |
 | `--insecure-http` | Allow plain HTTP on a non-loopback address. Without it the server refuses to start. Only for a private network behind a TLS-terminating proxy. |
-| `--trust-proxy` | Take the client IP from the right-most `X-Forwarded-For` entry, honoured only from a loopback or private-network peer and only when it is an IP address (otherwise the peer address counts). Only behind a proxy you control: without one, clients can spoof their IP and dodge the auth rate limit. Behind a local proxy, set it, or every client shares the proxy's address for that limit. The proxy must append the address it saw (Caddy does; nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` or `$remote_addr`). |
+| `--trust-proxy` | Take the client IP from the right-most `X-Forwarded-For` entry, honoured only from a loopback or private-network peer and only when it is an IP address (otherwise the peer address counts). Only behind a proxy you control: without one, clients can spoof their IP and dodge the auth rate limit. Behind a local proxy, set it, or every client shares the proxy's address for that limit. The proxy must append the address it saw (nginx: `proxy_set_header X-Forwarded-For $remote_addr;`, Caddy does it by default). |
 | `--allow-local-targets` | Let profiles and proxies point at this host's own loopback, link-local or cloud-metadata addresses (127.0.0.0/8, ::1, 169.254.0.0/16, fe80::/10, 0.0.0.0/8, 100.100.100.200, fd00:ec2::254). Refused by default. |
 | `--allowed-origin <origin>` | Exact `scheme://host[:port]` a browser-based client may call from (repeatable). Default: none. Requests without `Origin` (CLI agents) are not affected. |
+| `--allow-tofu` | Let a session pin a profile's host key on its first connection (trust on first use). Off by default: an unpinned profile is refused until the owner pins it with `vault pin-host-key`. |
 | `--oauth`, `--public-url`, `--oauth-redirect` | Claude connectors; see the next section. |
 
 ## Claude connectors (OAuth)
@@ -119,8 +173,8 @@ limit is cryptographic, not a check in the code.
 mcp-sshpilot serve --oauth --public-url https://mcp.example.com      # plus your usual flags
 ```
 
-In the Docker deployment, append `"--oauth", "--public-url", "https://mcp.example.com"` to the `command:` of the
-`sshpilot` service (the shipped Caddyfile already routes `/.well-known/oauth-*` and `/oauth/*`). Then in Claude:
+With the systemd unit above, append `--oauth --public-url https://mcp.example.com` to `ExecStart` (the nginx
+`location /` already passes `/.well-known/oauth-*` and `/oauth/*` through). Then in Claude:
 Settings -> Connectors -> Add custom connector -> `https://mcp.example.com/mcp`.
 
 | Flag | Meaning |
@@ -275,7 +329,7 @@ grant token   = sshp_g<8 hex grant id>_<base64url(32 random bytes)>     (code, a
 | Theft of the disk, a backup or a VM snapshot | The vault is ciphertext; no key on disk can open it. |
 | A stolen token, after you revoke the device | The device entry (its hash and its wrap of the DEK) is gone; its live sessions are closed on the next request to the server, and a request whose body was still arriving is checked again before it runs. |
 | A leaked recovery key | `vault rotate` issues a new recovery key and re-keys the vault; the old key opens neither the new vault nor any later copy. |
-| Network attackers | TLS (Caddy or native), plain HTTP refused off-loopback unless forced. |
+| Network attackers | TLS (reverse proxy or native), plain HTTP refused off-loopback unless forced. |
 | Token guessing | 256-bit secrets. Failed attempts are also limited per IP (IPv6: per /64), 10 per 5 minutes, then 429; a valid token is always accepted, so a client sharing your address cannot lock you out. A request without a bearer token is no guess and is not counted, and with OAuth on any grant-shaped token gets the plain 401 and is not counted either: connectors share Anthropic's egress addresses with every other Claude user, a 429 there would keep the connector from refreshing, and answering an unknown grant id differently from a known one would tell which grants exist. At the token endpoint only unknown codes and refresh tokens count. |
 | A malicious web page in your browser (DNS rebinding, CSRF) | Any request carrying an `Origin` header that is not explicitly allowed gets 403; no CORS headers otherwise. |
 | One device hijacking another's session | A session id works only with the token of the device that opened it; others get the same 404 as for an unknown id. |
@@ -297,8 +351,8 @@ grant token   = sshp_g<8 hex grant id>_<base64url(32 random bytes)>     (code, a
 | Root (or the service user) on the live host while a session is open | The DEK and decrypted profiles are in process memory then. Run the server on a box you trust as much as the SSH servers it reaches. |
 | A compromised client device | Its token is in the MCP client config (for Claude Code: `~/.claude.json`). Revoke the device. |
 | The agent itself | A connected agent can do whatever the profiles allow: run commands, read and write files, add its own key to a server. The dangerous-command and delete confirmations still apply, but they are a seatbelt for mistakes, not a security boundary. |
-| A network attacker on a profile's first connection | Pinning is trust on first use: whoever answers the very first connection over the stored route gets pinned (and receives the password). Pin keys you have verified with `vault pin-host-key` before first use when that matters. Profiles imported from a `servers.json` used in stdio mode keep the pins they already have. |
-| Other hosts on private networks, and the host's other addresses | Only the ranges above are refused. Private ranges stay reachable because your servers may live there; in the Docker deployment the compose network holds nothing but Caddy. The MCP host's own LAN or public address and the Docker gateway (172.17.0.1) are not recognised as "itself", and behind a proxy the target is resolved by the proxy, so only the proxy's address is checked: do not run an open SOCKS/HTTP proxy on the MCP host or its private network. |
+| A network attacker on a profile's first connection | Refused by default: an unpinned profile does not connect in remote mode. With `--allow-tofu`, pinning is trust on first use: whoever answers the very first connection over the stored route gets pinned (and receives the password). Profiles imported from a `servers.json` used in stdio mode keep the pins they already have. |
+| Other hosts on private networks, and the host's other addresses | Only the ranges above are refused. Private ranges stay reachable because your servers may live there; the MCP host's own LAN or public address (and a Docker gateway such as 172.17.0.1, if the host runs Docker) are not recognised as "itself", and behind a proxy the target is resolved by the proxy, so only the proxy's address is checked: do not run an open SOCKS/HTTP proxy on the MCP host or its private network. |
 | A revoked device that kept a copy of `vault.json` | Its old wrap of the DEK still opens that old copy (and any later copy until you rotate). See below. |
 | A compromise on Anthropic's side (or of your Claude account) | Connector tokens live in Anthropic's cloud. Whoever controls them can use the granted profiles until the grant expires or you revoke it. Grant only what a connector needs, for as short as practical. |
 | A consent link someone sends you, and OAuth mix-up | The link (or a malicious connector that points Claude at your authorization endpoint) opens the genuine consent page on your own server, so the "check the address bar" rule passes; approving connects the other party's client. Mitigations only: both pages warn against forwarded links and show the client id and how long ago it registered (a connector you just added registered seconds ago), and authorization responses carry `iss` (RFC 9207), which a client that checks it uses to detect a mix-up. Approve only a connection you started yourself a moment ago. |
@@ -341,7 +395,10 @@ TLS still protects the token in transit. Treat a token like an SSH private key.
 ## Host key pinning (both modes)
 
 The first `ssh_connect_profile` to a profile pins the server's host key (`SHA256:...`, the same format
-`ssh-keygen -lf` prints) into the profile and says so in the result. Later connections, including automatic
+`ssh-keygen -lf` prints) into the profile and says so in the result. In remote mode that first, unpinned connection
+is refused unless the server runs with `--allow-tofu`: pin keys with `vault pin-host-key` (in stdio mode
+`ssh_pin_host_keys` reads them without sending credentials; profiles imported from such a `servers.json` keep
+their pins). Later connections, including automatic
 reconnects, must present the same key; a different key aborts the handshake before authentication, so no
 password or key is sent, and the error tells the agent to stop and report to the user rather than re-pin.
 
@@ -351,9 +408,9 @@ key (a port change on the same server keeps working), anything else is refused u
 Re-pinning a legitimately changed key, after checking it on the server itself:
 
 - **Remote mode: only the owner, out of band.** The model cannot drop or set a pin (`reset_host_key` is not
-  available). Run it where the live vault is, with an unlock key: on the server through the `vault` compose
-  service, `docker compose run --rm vault pin-host-key <profile> SHA256:...` (natively:
-  `mcp-sshpilot vault pin-host-key ...` with `MCP_SSHPILOT_VAULT` pointing at the served file), or `--clear` to let
+  available). Run it where the live vault is, with an unlock key, as the service user:
+  `mcp-sshpilot vault pin-host-key <profile> SHA256:...` with `MCP_SSHPILOT_VAULT` pointing at the served file
+  (see "Vault commands on the server" above), or `--clear` to let
   the next direct connection pin again. Never pin on an older copy and put it over the server's vault: that rolls
   back every revocation, rotation and pin made since the copy was taken.
 - **stdio mode:** `ssh_server_update { name, reset_host_key: true }`, then `ssh_connect_profile`. Here the model
@@ -414,9 +471,9 @@ overrides and pending confirmations are per session.
   after 2 s even if the peer never closes its side, so pending SFTP requests fail and release what they held.
 - **NAT:** the failed-auth limit is per IP. Clients behind the same NAT as an attacker may see 429 for a bad token,
   but a valid token always passes.
-- **Memory (Docker):** temp stores share the 256 MiB `/tmp` tmpfs, which counts against the 1 GiB `mem_limit`;
-  when it is full, downloads fail with "no space" instead of the container being OOM-killed. Raise both together.
-- **Host header** validation is left to the reverse proxy (the Caddyfile serves only `$SSHPILOT_DOMAIN`).
+- **Memory:** all temp stores together are capped at 256 MiB. If `/tmp` is a tmpfs (systemd `PrivateTmp` on some
+  distributions), those pages count against `MemoryMax`; keep it above the temp cap plus a few hundred MiB.
+- **Host header** validation is left to the reverse proxy (serve only your `server_name`).
 - A vault write from the server can block it for up to 5 s while a CLI vault command holds the lock (CLI commands
   take milliseconds): a profile change, a consent approval, or a token request carrying a real code or refresh
   token. A request without a secret never waits for the lock (an unknown refresh token that would revoke its grant

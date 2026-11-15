@@ -1,7 +1,7 @@
 {
   "name": "mcp-sshpilot",
   "version": "1.4.0",
-  "description": "MCP server for managing remote machines over SSH — proxy support (SOCKS4/5, HTTP/HTTPS CONNECT), SFTP, dangerous-command guard, background jobs, server profiles, host-key pinning, and a remote mode (Streamable HTTP) with an encrypted profile vault.",
+  "description": "MCP server for SSH: saved profiles the agent never sees, several servers at once, host-key pinning, SFTP, proxies (SOCKS/HTTP), dangerous-command guard, and an HTTPS remote mode with an encrypted vault.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
