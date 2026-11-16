@@ -494,6 +494,6 @@ export async function sshUpload(conn: Conn, localPathArg: string, remotePath: st
       exclude.length > 0 ? `🚫 Excluded: ${exclude.join(", ")}` : "",
     ].filter(Boolean).join("\n");
   } finally {
-    try { unlinkSync(tempTarPath); } catch { /* ignore */ }
+    try { unlinkSync(tempTarPath); } catch { /* tar never created it */ }
   }
 }

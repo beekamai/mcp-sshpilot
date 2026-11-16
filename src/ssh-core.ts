@@ -22,7 +22,8 @@ import { listTempFiles, deleteTempFile } from "./temp.js";
 
 const EXEC_OUTPUT_CAP = 1024 * 1024;
 const BACKGROUND_OUTPUT_CAP = 256 * 1024;
-/* Remote mode keeps finished jobs (and their output) for ssh_read_background, but not without bound. */
+/* Jobs kept per session, finished ones included so ssh_read_background can still read their output. At the cap
+ * the oldest finished job is dropped (both modes); remote mode refuses a new job while all of them still run. */
 const REMOTE_MAX_BACKGROUND_JOBS = 32;
 const JOB_COMMAND_DISPLAY_CHARS = 4096;
 
@@ -69,14 +70,14 @@ export function hostKeyFingerprint(key: Buffer): string {
   return "SHA256:" + createHash("sha256").update(key).digest("base64").replace(/=+$/, "");
 }
 
-/* Accepts "SHA256:<b64>" (any prefix case) or bare base64, padded or not, so a value pasted from ssh-keygen -lf matches. */
+/** Accepts "SHA256:<b64>" (any prefix case) or bare base64, padded or not, so a value pasted from ssh-keygen -lf matches. */
 export function normalizeHostKeyFingerprint(fp: string): string {
   const b64 = fp.trim().replace(/^sha256:/i, "").replace(/=+$/, "");
   return `SHA256:${b64}`;
 }
 
-/* The agent reads this. It must stop rather than re-pin: an agent cannot verify a key out of band, and following
- * a "how to fix" line here would hand the credentials to whoever answered. */
+/** The agent reads this message. It must stop rather than re-pin: an agent cannot verify a key out of band, and
+ * following a "how to fix" line here would hand the credentials to whoever answered. */
 export class HostKeyMismatchError extends Error {
   /** pinned: expected is a profile's pin; otherwise only the key an earlier connect of this session saw.
    * credentialsSent: the pin turned up only after authentication (set meanwhile by another session or a scan). */
@@ -524,7 +525,7 @@ export interface CommandResult {
   limitMs: number;
 }
 
-/* A command that forks a process inheriting stdout keeps the channel open forever,
+/** A command that forks a process inheriting stdout keeps the channel open forever,
  * so every exec has a hard timeout that kills the channel and returns partial output.
  * Output is kept as a bounded tail so `cat hugefile` cannot exhaust memory. */
 export function runCommand(conn: Conn, command: string, timeoutMs?: number, stdin?: string): Promise<CommandResult> {
@@ -557,8 +558,8 @@ export function runCommand(conn: Conn, command: string, timeoutMs?: number, stdi
 
       const timer = setTimeout(() => {
         addLog(conn, "warning", `Command timeout (${limitMs}ms): ${command}`);
-        try { if (typeof (stream as any).signal === "function") (stream as any).signal("KILL"); } catch { /* ignore */ }
-        try { stream.close(); } catch { /* ignore */ }
+        try { if (typeof (stream as any).signal === "function") (stream as any).signal("KILL"); } catch { /* channel gone */ }
+        try { stream.close(); } catch { /* channel gone */ }
         finish(null, undefined, true);
       }, limitMs);
 
@@ -573,12 +574,12 @@ export function runCommand(conn: Conn, command: string, timeoutMs?: number, stdi
 /** Remote mode: a running call keeps its session from the idle sweep and from eviction, so it may not run for weeks. */
 export const REMOTE_MAX_EXEC_TIMEOUT_MS = 60 * 60 * 1000;
 
-/* setTimeout fires immediately for delays above 2^31-1 ms. */
+/** Positive numbers capped at max (default below 2^31-1: setTimeout fires immediately above that); else undefined. */
 export function clampTimeout(ms: unknown, max: number = 2_000_000_000): number | undefined {
   return typeof ms === "number" && ms > 0 ? Math.min(ms, max) : undefined;
 }
 
-/* Runs a POSIX sh script fed through stdin, so the login shell (fish, PowerShell, ...) never parses our quoting. */
+/** Runs a POSIX sh script fed through stdin, so the login shell (fish, PowerShell, ...) never parses our quoting. */
 export function runScript(conn: Conn, script: string, timeoutMs?: number): Promise<CommandResult> {
   return runCommand(conn, "sh -s", timeoutMs, script);
 }

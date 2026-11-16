@@ -529,7 +529,7 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
     /* An open response would otherwise keep its queued results until the client goes away. */
     for (const r of s.responses) r.destroy();
     s.responses.clear();
-    /* Drops the SSH connection, background jobs, temp dir and zero-fills the vault key. */
+    /* Drops every SSH connection, background jobs and the temp dir, and zero-fills the vault key. */
     destroyCtx(s.ctx);
     s.server.close().catch(() => {});
     log(`${new Date().toISOString()} session closed device=${clean(s.deviceName)} session=${s.id.slice(0, 8)} reason=${reason}`);
@@ -802,7 +802,7 @@ export function startHttpServer(opts: HttpServerOptions): Promise<HttpServerHand
       throw new HttpError(405, "", { Allow: "GET, POST, DELETE" });
     }
 
-    /* Before auth: a revoked device's next request fails with 401, and its live sessions (SSH connection, vault
+    /* Before auth: a revoked device's next request fails with 401, and its live sessions (SSH connections, vault
      * key) must end right then, not at the next sweep. Cheap: the device list is cached by the vault file's stat. */
     enforceRevocations();
 

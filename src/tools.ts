@@ -467,8 +467,9 @@ const REMOTE_KEY_PROPERTY = {
   description: "Private key contents (PEM/OpenSSH). Stored encrypted in the vault; never returned by any tool.",
 };
 
-/* Connector grants are read-only snapshots: the only store write they keep is a first-use host-key pin, and the
- * proxy tools would let the model reroute (or unpin-gate) a granted profile. */
+/* Connector grants are read-only snapshots: the only store write they keep is a first-use host-key pin. The proxy
+ * tools are off too: a runtime override would reroute a granted profile, or trip the route check on an unpinned
+ * one's first connection. */
 const SCOPED_DISABLED_TOOLS = new Set([
   "ssh_server_add",
   "ssh_server_update",

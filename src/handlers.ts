@@ -799,7 +799,7 @@ async function dispatch(ctx: SessionCtx, name: string, args: any, hold: ReadBudg
           `  File: ${result.tempFile.filename}`,
           `  Size: ${formatBytes(result.tempFile.size)}`,
           `  Type: ${result.tempFile.isBinary ? "binary" : "text"}`,
-          /* The MCP host's filesystem layout is none of a remote client's business. */
+          /* Remote clients must not learn the MCP host's filesystem layout. */
           ...(ctx.mode === "remote" ? [] : [`  Local: ${result.tempFile.localPath}`]),
           `  Remote: ${result.tempFile.remotePath}`,
           `  Connection: ${c.name}`,

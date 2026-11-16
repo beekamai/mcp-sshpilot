@@ -1,4 +1,4 @@
-/* Interleavings found in review: voided connects, peers that hang up mid-handshake, arguments that must not be read
+/* Interleavings and edge cases: voided connects, peers that hang up mid-handshake, arguments that must not be read
  * as "omitted", and bindings that must outlive a moved profile. */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";

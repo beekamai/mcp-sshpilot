@@ -52,8 +52,6 @@ export interface ProfileStore {
   update?<T>(mutate: (cfg: ServersConfig) => T): T;
   /** Local files holding this store's secrets (the config itself, key files); ssh_upload refuses them. */
   protectedPaths?(): string[];
-  /** Remote device sessions: a one-time code (10 minutes, single use) that approves a Claude connector in place of
-   * a device token. expiresAt is ISO 8601. */
 }
 
 /** Read-modify-write of the profiles; atomic where the store supports it (the vault), load + save otherwise. */
@@ -143,7 +141,7 @@ export class FileProfileStore implements ProfileStore {
     return parsed;
   }
 
-  /* Creates parent dirs and a stub `{ servers: [] }` so users see a clear file to edit (and CRUD tools
+  /** Creates parent dirs and a stub `{ servers: [] }` so users see a clear file to edit (and CRUD tools
    * have somewhere to write). Idempotent: never overwrites an existing file. */
   ensureExists(): { created: boolean; path: string } {
     if (existsSync(this.path)) return { created: false, path: this.path };
@@ -153,7 +151,7 @@ export class FileProfileStore implements ProfileStore {
     return { created: true, path: this.path };
   }
 
-  /* Temp file + rename so a crash mid-write cannot truncate the profiles. The temp name is random and
+  /** Temp file + rename so a crash mid-write cannot truncate the profiles. The temp name is random and
    * created exclusively (no pre-planted file), 0600 on POSIX because the file holds passwords. */
   save(cfg: ServersConfig): void {
     const dir = dirname(this.path);
@@ -170,7 +168,7 @@ export class FileProfileStore implements ProfileStore {
     }
   }
 
-  /* Several stdio processes (one per client session) share this file and every first connect writes a pin: re-read
+  /** Several stdio processes (one per client session) share this file and every first connect writes a pin: re-read
    * under the lock so one process never saves a copy that predates another's write. */
   update<T>(mutate: (cfg: ServersConfig) => T): T {
     return withConfigLock(this.path, () => {

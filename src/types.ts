@@ -23,7 +23,7 @@ export interface ServerProfile {
   /** Pinned host key, "SHA256:<base64>" as OpenSSH prints it. */
   hostKeySha256?: string;
   description?: string;
-  /* Per-server proxy. null = force direct connection, overriding the global proxy. */
+  /** Per-server proxy. null = force direct connection, overriding the global proxy. */
   proxy?: ProxyConfig | null;
 }
 
@@ -52,7 +52,7 @@ export interface SSHSession {
   id: string;
   /** user@host:port [via proxy], shown when a confirmation is refused. */
   target: string;
-  /* One SFTP channel per session: opening one per call exhausts sshd MaxSessions (default 10). */
+  /** One SFTP channel per session: opening one per call exhausts sshd MaxSessions (default 10). */
   sftp?: Promise<SFTPWrapper>;
   /** Host key seen in this handshake, "SHA256:<base64>". */
   hostKeySha256?: string;

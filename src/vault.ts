@@ -970,7 +970,7 @@ export class VaultProfileStore implements ProfileStore {
     writeProfiles(this.path, this.dek, cfg);
   }
 
-  /* One lock around read, mutate and write: an owner's `vault pin-host-key` committed between a separate load and
+  /** One lock around read, mutate and write: an owner's `vault pin-host-key` committed between a separate load and
    * save would be overwritten by this session's older copy. */
   update<T>(mutate: (cfg: ServersConfig) => T): T {
     this.check();
@@ -994,6 +994,8 @@ export class VaultProfileStore implements ProfileStore {
     this.dek.fill(0);
   }
 }
+
+/* ---------- OAuth clients and connector grants ---------- */
 
 /** A public OAuth client, verified from its self-contained id; nothing is stored for it until a grant is created. */
 export interface ClientInfo {
@@ -1060,8 +1062,6 @@ interface ClientPayload {
   t: number;
   x: string;
 }
-
-/* ---------- OAuth clients and connector grants ---------- */
 
 const GRANT_TOKEN_RE = /^sshp_g([0-9a-f]{8})_([A-Za-z0-9_-]{43})$/;
 const GRANT_VAULT_AAD = "mcp-sshpilot-grant-v1:";
@@ -1484,7 +1484,7 @@ function retryOf(grant: GrantEntry, tok: TokenEntry, secret: Buffer, clientId: s
 /**
  * Refresh token rotation: a new pair, the old refresh token spent. A retry of the last rotation gets the same pair
  * (retryOf; onRetry is told); any other rotated refresh token, or one whose spent record was pushed out (a thief can
- * rotate 9 times to do that) presented by the grant's own client, is a leak and revokes the grant.
+ * rotate MAX_SPENT_TOKENS + 1 times to do that) presented by the grant's own client, is a leak and revokes the grant.
  */
 export function refreshGrant(
   path: string,
@@ -1687,7 +1687,7 @@ export class GrantProfileStore implements ProfileStore {
     });
   }
 
-  /* Same lock as every other vault write, so a pin saved here cannot drop a device or grant written meanwhile. */
+  /** Same lock as every other vault write, so a pin saved here cannot drop a device or grant written meanwhile. */
   update<T>(mutate: (cfg: ServersConfig) => T): T {
     return withLock(this.path, (commit) => {
       const file = readFresh(this.path);

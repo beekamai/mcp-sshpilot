@@ -1,4 +1,4 @@
-/* Second review round: connection namespaces, credentials that must not travel or linger, and upload guards. */
+/* Connection namespaces, credentials that must not travel or linger, and upload guards. */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
